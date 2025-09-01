@@ -2,7 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
 const { execSync } = require("child_process");
-const constants = require("../constants"); // Make sure path is correct
+const constants = require("../constants");
 
 // Get environment from CLI argument: dev, qa, prod
 const env = process.argv[2] || "dev";
@@ -16,10 +16,10 @@ if (!config) {
 console.log("Using environment:", env);
 console.log("Config:", config);
 
-// Root folder containing your collection JS files
+// Get the Root folder path 
 const SRC_DIR = path.join(__dirname, "../src");
 
-// Get changed files using git diff (compared to main branch)
+// Get changed files using git diff compared to main branch varies depedning on envoirment in real time
 function getChangedFiles() {
   try {
     const output = execSync("git diff --name-only main", { encoding: "utf-8" });
@@ -28,7 +28,7 @@ function getChangedFiles() {
       .filter(
         file =>
           file.endsWith(".js") &&
-          file.startsWith("src" + path.sep) // Only src folder
+          file.startsWith("src" + path.sep)
       )
       .map(file => path.resolve(file));
   } catch (err) {
@@ -37,7 +37,11 @@ function getChangedFiles() {
   }
 }
 
-// Recursively get all JS files in src folder
+/** 
+ * Recursively get all JavaScript files from a directory and its subdirectories.
+ * @param {string} dir - The directory path to scan.
+ * @returns {string[]} - Array of full paths to all .js files found.
+ */
 function getAllJsFiles(dir) {
   let files = [];
   fs.readdirSync(dir).forEach(file => {
@@ -51,7 +55,11 @@ function getAllJsFiles(dir) {
   return files;
 }
 
-// Construct Couchbase App Services endpoint URL
+/**
+ * Construct the Couchbase App Services endpoint URL for a JS file.
+ * @param {string} filePath - Full path to the JS file.
+ * @returns {string|null} - Full URL to the accessControlFunction, or null if invalid path.
+ */
 function buildUrl(filePath) {
   const relativePath = path.relative(SRC_DIR, filePath);
   const parts = relativePath.split(path.sep);
@@ -66,10 +74,13 @@ function buildUrl(filePath) {
   return `${config.baseUrl}/organizations/${config.orgId}/projects/${config.projectId}/clusters/${config.clusterId}/endpoints/${endpoint}.${scope}.${collection}/accessControlFunction`;
 }
 
-// Deploy JS function to Couchbase
+/**
+ * Deploy a JS file to Couchbase App Services.
+ * @param {string} filePath - Full path to the JS file.
+ */
 async function deployFile(filePath) {
   const url = buildUrl(filePath);
-  if (!url) return; // skip invalid paths
+  if (!url) return; 
 
   const code = fs.readFileSync(filePath, "utf-8");
 
@@ -85,9 +96,9 @@ async function deployFile(filePath) {
         Authorization: `Bearer ${config.apiKey}`,
       },
     });
-    console.log(`✅ Deployed: ${filePath}`);
+    console.log(`Deployed: ${filePath}`);
   } catch (err) {
-    console.error(`❌ Failed to deploy ${filePath}`);
+    console.error(`Failed to deploy ${filePath}`);
     if (err.response) {
       console.error("Response status:", err.response.status);
       console.error("Response data:", err.response.data);

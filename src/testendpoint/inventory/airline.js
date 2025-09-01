@@ -1,6 +1,6 @@
 module.exports = `
 function (doc, oldDoc, meta) {
-    // Example: allow reads for everyone test it 
+    // Example: allow reads for everyone test it nowß
     if (doc.type === "public") {
         return true;
     }
