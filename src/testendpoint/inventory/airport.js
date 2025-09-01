@@ -5,5 +5,4 @@ function (doc, oldDoc, meta) {
         return true;
     }
     return false;
-}
-`;
+}`;

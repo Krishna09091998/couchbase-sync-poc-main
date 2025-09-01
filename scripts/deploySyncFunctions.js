@@ -23,19 +23,21 @@ const SRC_DIR = path.join(__dirname, "../src");
 function getChangedFiles() {
   try {
     const output = execSync("git diff --name-only main", { encoding: "utf-8" });
-    const files = output
+    return output
       .split("\n")
-      .filter(file => file.endsWith(".js"))
+      .filter(
+        file =>
+          file.endsWith(".js") &&
+          file.startsWith("src" + path.sep) // Only src folder
+      )
       .map(file => path.resolve(file));
-    console.log("Changed files detected:", files);
-    return files;
   } catch (err) {
     console.error("Error getting git diff:", err.message);
     return [];
   }
 }
 
-// Recursively get all JS files if git diff is empty (fallback for first run)
+// Recursively get all JS files in src folder
 function getAllJsFiles(dir) {
   let files = [];
   fs.readdirSync(dir).forEach(file => {
@@ -49,43 +51,43 @@ function getAllJsFiles(dir) {
   return files;
 }
 
-// Construct Couchbase App Services endpoint URL dynamically
+// Construct Couchbase App Services endpoint URL
 function buildUrl(filePath) {
   const relativePath = path.relative(SRC_DIR, filePath);
   const parts = relativePath.split(path.sep);
-
-  if (parts.length < 3) {
-    throw new Error(`Invalid file path: ${filePath}. Must be endpoint/scope/collection.js`);
+  const len = parts.length;
+  if (len < 3) {
+    console.warn("Skipping invalid file path (needs endpoint/scope/collection):", filePath);
+    return null;
   }
-
   const endpoint = parts[0];
   const scope = parts[1];
   const collection = path.basename(parts[2], ".js");
-
-  const url = `${config.baseUrl}/organizations/${config.orgId}/projects/${config.projectId}/clusters/${config.clusterId}/endpoints/${endpoint}/scopes/${scope}/collections/${collection}/accessControlFunction`;
-  console.log(`URL for ${filePath}:`, url);
-  return url;
+  return `${config.baseUrl}/organizations/${config.orgId}/projects/${config.projectId}/clusters/${config.clusterId}/endpoints/${endpoint}.${scope}.${collection}/accessControlFunction`;
 }
 
 // Deploy JS function to Couchbase
 async function deployFile(filePath) {
   const url = buildUrl(filePath);
+  if (!url) return; // skip invalid paths
+
   const code = fs.readFileSync(filePath, "utf-8");
 
-  console.log(`Deploying file: ${filePath}`);
-  console.log("Code snippet (first 200 chars):", code.substring(0, 200));
+  console.log("Deploying file:", filePath);
+  console.log("URL:", url);
+  console.log("Code snippet (first 200 chars):", code.slice(0, 200));
   console.log("Authorization header:", `Bearer ${config.apiKey}`);
 
   try {
-    const res = await axios.put(url, { function: code }, {
+    await axios.put(url, code, {
       headers: {
         "Content-Type": "application/javascript",
         Authorization: `Bearer ${config.apiKey}`,
       },
     });
-    console.log(`Deployed successfully: ${filePath}`, res.status);
+    console.log(`✅ Deployed: ${filePath}`);
   } catch (err) {
-    console.error(`Failed to deploy ${filePath}`);
+    console.error(`❌ Failed to deploy ${filePath}`);
     if (err.response) {
       console.error("Response status:", err.response.status);
       console.error("Response data:", err.response.data);
@@ -98,8 +100,10 @@ async function deployFile(filePath) {
 (async () => {
   let filesToDeploy = getChangedFiles();
   if (filesToDeploy.length === 0) {
-    console.log("No changes detected. Deploying all files.");
+    console.log("No changes detected. Deploying all files in src/.");
     filesToDeploy = getAllJsFiles(SRC_DIR);
+  } else {
+    console.log("Changed files detected:", filesToDeploy);
   }
 
   for (const file of filesToDeploy) {
