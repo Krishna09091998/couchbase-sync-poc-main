@@ -2,7 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
 const { execSync } = require("child_process");
-const constants = require("./constants");
+const constants = require("../constants"); // Make sure path is correct
 
 // Get environment from CLI argument: dev, qa, prod
 const env = process.argv[2] || "dev";
@@ -13,18 +13,22 @@ if (!config) {
   process.exit(1);
 }
 
+console.log("Using environment:", env);
+console.log("Config:", config);
+
 // Root folder containing your collection JS files
-const SRC_DIR = path.join(__dirname, "src");
+const SRC_DIR = path.join(__dirname, "../src");
 
 // Get changed files using git diff (compared to main branch)
 function getChangedFiles() {
   try {
-    // Only list JS files
     const output = execSync("git diff --name-only main", { encoding: "utf-8" });
-    return output
+    const files = output
       .split("\n")
       .filter(file => file.endsWith(".js"))
       .map(file => path.resolve(file));
+    console.log("Changed files detected:", files);
+    return files;
   } catch (err) {
     console.error("Error getting git diff:", err.message);
     return [];
@@ -45,15 +49,22 @@ function getAllJsFiles(dir) {
   return files;
 }
 
-// Construct Couchbase App Services endpoint URL
+// Construct Couchbase App Services endpoint URL dynamically
 function buildUrl(filePath) {
-  // src/endpoint/scope/collection.js
-  const parts = filePath.split(path.sep);
-  const len = parts.length;
-  const endpoint = parts[len - 3];
-  const scope = parts[len - 2];
-  const collection = path.basename(parts[len - 1], ".js");
-  return `${config.baseUrl}/organizations/${config.orgId}/projects/${config.projectId}/clusters/${config.clusterId}/endpoints/${endpoint}.${scope}.${collection}/accessControlFunction`;
+  const relativePath = path.relative(SRC_DIR, filePath);
+  const parts = relativePath.split(path.sep);
+
+  if (parts.length < 3) {
+    throw new Error(`Invalid file path: ${filePath}. Must be endpoint/scope/collection.js`);
+  }
+
+  const endpoint = parts[0];
+  const scope = parts[1];
+  const collection = path.basename(parts[2], ".js");
+
+  const url = `${config.baseUrl}/organizations/${config.orgId}/projects/${config.projectId}/clusters/${config.clusterId}/endpoints/${endpoint}/scopes/${scope}/collections/${collection}/accessControlFunction`;
+  console.log(`URL for ${filePath}:`, url);
+  return url;
 }
 
 // Deploy JS function to Couchbase
@@ -61,16 +72,26 @@ async function deployFile(filePath) {
   const url = buildUrl(filePath);
   const code = fs.readFileSync(filePath, "utf-8");
 
+  console.log(`Deploying file: ${filePath}`);
+  console.log("Code snippet (first 200 chars):", code.substring(0, 200));
+  console.log("Authorization header:", `Bearer ${config.apiKey}`);
+
   try {
-    await axios.put(url, code, {
+    const res = await axios.put(url, { function: code }, {
       headers: {
         "Content-Type": "application/javascript",
         Authorization: `Bearer ${config.apiKey}`,
       },
     });
-    console.log(`Deployed: ${filePath}`);
+    console.log(`Deployed successfully: ${filePath}`, res.status);
   } catch (err) {
-    console.error(`Failed: ${filePath}`, err.response?.data || err.message);
+    console.error(`Failed to deploy ${filePath}`);
+    if (err.response) {
+      console.error("Response status:", err.response.status);
+      console.error("Response data:", err.response.data);
+    } else {
+      console.error(err.message);
+    }
   }
 }
 
