@@ -1,0 +1,16 @@
+{
+  "name": "couchbase-sync-poc",
+  "version": "1.0.0",
+  "description": "POC to deploy Couchbase App Services access control functions dynamically based on environment",
+  "main": "deploy.js",
+  "scripts": {
+    "deploy:dev": "node deploy.js dev",
+    "deploy:qa": "node deploy.js qa",
+    "deploy:prod": "node deploy.js prod"
+  },
+  "author": "krishnam raju B",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0"
+  }
+}
