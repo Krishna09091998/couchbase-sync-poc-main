@@ -71,7 +71,7 @@ function buildUrl(filePath) {
   const endpoint = parts[0];
   const scope = parts[1];
   const collection = path.basename(parts[2], ".js");
-  return `${config.baseUrl}/organizations/${config.orgId}/projects/${config.projectId}/clusters/${config.clusterId}/endpoints/${endpoint}.${scope}.${collection}/accessControlFunction`;
+  return `${config.baseUrl}/organizations/${config.orgId}/projects/${config.projectId}/clusters/${config.clusterId}/appservices/${config.appId}/appEndpoints/${endpoint}.${scope}.${collection}/accessControlFunction`;
 }
 
 /**
@@ -80,25 +80,40 @@ function buildUrl(filePath) {
  */
 async function deployFile(filePath) {
   const url = buildUrl(filePath);
-  if (!url) return; 
+  if (!url) return;
 
-  const code = fs.readFileSync(filePath, "utf-8");
+  // Read the JS code as string
+  let code = fs.readFileSync(filePath, "utf-8").trim();
+
+// If the file exports a string, extract it
+if (code.startsWith("module.exports")) {
+  const match = code.match(/`([\s\S]*)`/);
+  if (match) {
+    code = match[1].trim();
+  }
+}
+
+
+  // Wrap in JSON string (escaped)
+  const payload = code;
 
   console.log("Deploying file:", filePath);
   console.log("URL:", url);
-  console.log("Code snippet (first 200 chars):", code.slice(0, 200));
+  console.log("Payload preview (first 200 chars):", payload.slice(0, 200));
   console.log("Authorization header:", `Bearer ${config.apiKey}`);
 
   try {
-    await axios.put(url, code, {
-      headers: {
-        "Content-Type": "application/javascript",
-        Authorization: `Bearer ${config.apiKey}`,
-      },
-    });
-    console.log(`Deployed: ${filePath}`);
+    await fetch(url, {
+  method: "PUT",
+  headers: {
+    "Authorization": `Bearer ${config.apiKey}`,
+    "Content-Type": "application/json",
+  },
+  body: payload, // raw function, no stringify
+});
+    console.log(`✅ Deployed: ${filePath}`);
   } catch (err) {
-    console.error(`Failed to deploy ${filePath}`);
+    console.error(`❌ Failed to deploy ${filePath}`);
     if (err.response) {
       console.error("Response status:", err.response.status);
       console.error("Response data:", err.response.data);

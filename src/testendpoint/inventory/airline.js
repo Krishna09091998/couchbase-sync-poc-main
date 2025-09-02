@@ -4,6 +4,6 @@ function (doc, oldDoc, meta) {
     if (doc.type === "public") {
         return true;
     }
-    return false;
+    return true;
 } 
 `;

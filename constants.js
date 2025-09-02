@@ -3,6 +3,7 @@ module.exports = {
     orgId: "9ee31067-ad63-42a6-99ff-7f35a693818f",
     projectId: "b3ec2efb-2b15-41cf-a711-8c02ee5f94e3",
     clusterId: "da1e99d2-45cb-474b-9b75-7ec0cae8bb62",
+    appId:"50ecad18-8ef1-40d1-ab77-398e239150d7",
     apiKey: "cmhQTExaWnhneHdVbHFsajBtRGsyckZPZzdkNkUyNkI6LVNLTzJ+WHBPQHZ4V2RRR15FeE11RXBUTyVkT244TGZEQ2JWSTl1MyFebTYrZC0xQj9jfnclQ3RRRGMzIzdQRA==",
     baseUrl: "https://cloudapi.cloud.couchbase.com/v4"
   },
