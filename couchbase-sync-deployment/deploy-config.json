@@ -1,0 +1,39 @@
+{
+  "DEV3": {
+    "cluster": "https://cloudapi.cloud.couchbase.com/v4",
+    "organizationId": "beafc496-db70-4110-9b40-edfa5268108e",
+    "projectId": "b410f033-4a0f-4fad-9d07-340eb327f5fe",
+    "clusterId": "d193daeb-9686-4b7e-af6b-29b5c6ee75ec",
+    "appServiceId": "a2324926-3cd8-4a91-9fe6-ac05b42ebad2",
+    "apiKey": "Z0hXcGYyT1Btb25EOFgwQkNEY25STW00aTRTQlZ4Mjg6UWNvbWFUMzM2VUlGWUxLQ0ZIazl4RXJ0cCRjOHo5VGxpME4/enBOXm5Id1V4RmdIPyVIVSVFfnZUMyFPaTdyVg==",
+    "master": {"appEndpointName": "path-master-dev3","bucket": "Path-Master-Dev3","scope": "masterdata"},
+    "grande": {"appEndpointName": "path-grande-dev3","bucket": "Path_Grande_Dev3","scope": "treatment"},
+    "lite": {"appEndpointName": "path-lite-dev3","bucket": "Path_Lite_Dev3","scope": "treatment"},
+    "resyncConfig": {
+      "path-master-dev3": {
+        "scopes": {
+          "masterdata": [
+            "CommonValue",
+            "Configuration"
+          ]
+        }
+      },
+      "path-grande-dev3": {
+        "scopes": {
+          "treatment": [
+            "HDIntraTreatment",
+            "HospitalConfiguration"
+          ]
+        }
+      },
+      "path-lite-dev3": {
+        "scopes": {
+          "treatment": [
+            "DeviceMetaData",
+            "UserInfo"
+          ]
+        }
+      }
+    }
+  }
+}
