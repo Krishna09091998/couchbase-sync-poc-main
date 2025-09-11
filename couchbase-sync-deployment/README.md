@@ -46,8 +46,8 @@ Automates deployment of Couchbase App Services Access Control / Validation funct
 ## Deployment
 
 #NODEJS SCRIPT 
-- Run script for desired environment:  
-  `node deploy.js`
+- Run script for desired environment:  pass the required apptypes as mentioned below
+  `node deploy.js master grande lite`
 
 #SHELL SCRIPT 
 # Ensure jq and curl are installed
