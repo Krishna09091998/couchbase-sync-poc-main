@@ -33,9 +33,14 @@ MASTER_SCOPE=$(jq -r ".$ENVIRONMENT.master.scope" $DEPLOY_CONFIG)
 GRANDE_SCOPE=$(jq -r ".$ENVIRONMENT.grande.scope" $DEPLOY_CONFIG)
 LITE_SCOPE=$(jq -r ".$ENVIRONMENT.lite.scope" $DEPLOY_CONFIG)
 
+# ========= CLI ARGUMENT HANDLING =========
+TYPES_TO_PROCESS=("$@")
+if [ ${#TYPES_TO_PROCESS[@]} -eq 0 ]; then
+  TYPES_TO_PROCESS=("master" "grande" "lite")
+fi
+
 # ========= FUNCTIONS =========
 
-# Deploy one sync function
 deploy_sync_function() {
   APP_TYPE=$1
   APP_ENDPOINT=$2
@@ -64,7 +69,6 @@ deploy_sync_function() {
   fi
 }
 
-# Pause endpoint
 pause_endpoint() {
   APP_ENDPOINT=$1
   URL="${CLUSTER}/organizations/${ORG_ID}/projects/${PROJECT_ID}/clusters/${CLUSTER_ID}/appservices/${APP_SERVICE_ID}/appEndpoints/${APP_ENDPOINT}/activationStatus"
@@ -72,7 +76,6 @@ pause_endpoint() {
   echo "Paused $APP_ENDPOINT"
 }
 
-# Resume endpoint
 resume_endpoint() {
   APP_ENDPOINT=$1
   URL="${CLUSTER}/organizations/${ORG_ID}/projects/${PROJECT_ID}/clusters/${CLUSTER_ID}/appservices/${APP_SERVICE_ID}/appEndpoints/${APP_ENDPOINT}/activationStatus"
@@ -80,7 +83,6 @@ resume_endpoint() {
   echo "Resumed $APP_ENDPOINT"
 }
 
-# Start resync
 resync_collections() {
   APP_ENDPOINT=$1
   SCOPE=$2
@@ -97,7 +99,6 @@ resync_collections() {
   echo "Triggered resync for $APP_ENDPOINT"
 }
 
-# Check resync status
 get_resync_status() {
   APP_ENDPOINT=$1
   URL="${CLUSTER}/organizations/${ORG_ID}/projects/${PROJECT_ID}/clusters/${CLUSTER_ID}/appservices/${APP_SERVICE_ID}/appEndpoints/${APP_ENDPOINT}/resync"
@@ -105,7 +106,6 @@ get_resync_status() {
   echo "$STATE"
 }
 
-# Full resync flow
 resync_flow() {
   ENDPOINT=$1
   SCOPE=$2
@@ -116,7 +116,6 @@ resync_flow() {
   # Pause
   pause_endpoint "$ENDPOINT" || return 1
 
-  # Handle resume if later steps fail
   {
     resync_collections "$ENDPOINT" "$SCOPE" "$COLLECTIONS" || { resume_endpoint "$ENDPOINT"; return 1; }
 
@@ -144,36 +143,63 @@ resync_flow() {
   }
 }
 
-# ========= MAIN =========
+# ========= MAIN SCRIPT =========
 echo "Starting deployment for environment: $ENVIRONMENT"
-
 DEPLOY_START=$(date +%s)
 
-# Deploy sync functions
-jq -c '.masterCollections[]' $COLLECTIONS_CONFIG | while read -r collection; do
-  NAME=$(echo $collection | jq -r '.name')
-  SYNC_FILE=$(echo $collection | jq -r '.syncFunctionFile')
-  deploy_sync_function "master" "$MASTER_APP_ENDPOINT" "$MASTER_SCOPE" "$NAME" "$SYNC_FILE"
-done
+# ========== SYNC FUNCTION DEPLOYMENT ==========
+for TYPE in "${TYPES_TO_PROCESS[@]}"; do
+  echo "Deploying sync functions for $TYPE..."
 
-jq -c '.grandeCollections[]' $COLLECTIONS_CONFIG | while read -r collection; do
-  NAME=$(echo $collection | jq -r '.name')
-  SYNC_FILE=$(echo $collection | jq -r '.syncFunctionFile')
-  deploy_sync_function "grande" "$GRANDE_APP_ENDPOINT" "$GRANDE_SCOPE" "$NAME" "$SYNC_FILE"
-done
-
-jq -c '.liteCollections[]' $COLLECTIONS_CONFIG | while read -r collection; do
-  NAME=$(echo $collection | jq -r '.name')
-  SYNC_FILE=$(echo $collection | jq -r '.syncFunctionFile')
-  deploy_sync_function "lite" "$LITE_APP_ENDPOINT" "$LITE_SCOPE" "$NAME" "$SYNC_FILE"
+  case "$TYPE" in
+    "master")
+      jq -c '.masterCollections[]' $COLLECTIONS_CONFIG | while read -r collection; do
+        NAME=$(echo $collection | jq -r '.name')
+        SYNC_FILE=$(echo $collection | jq -r '.syncFunctionFile')
+        deploy_sync_function "master" "$MASTER_APP_ENDPOINT" "$MASTER_SCOPE" "$NAME" "$SYNC_FILE"
+      done
+      ;;
+    "grande")
+      jq -c '.grandeCollections[]' $COLLECTIONS_CONFIG | while read -r collection; do
+        NAME=$(echo $collection | jq -r '.name')
+        SYNC_FILE=$(echo $collection | jq -r '.syncFunctionFile')
+        deploy_sync_function "grande" "$GRANDE_APP_ENDPOINT" "$GRANDE_SCOPE" "$NAME" "$SYNC_FILE"
+      done
+      ;;
+    "lite")
+      jq -c '.liteCollections[]' $COLLECTIONS_CONFIG | while read -r collection; do
+        NAME=$(echo $collection | jq -r '.name')
+        SYNC_FILE=$(echo $collection | jq -r '.syncFunctionFile')
+        deploy_sync_function "lite" "$LITE_APP_ENDPOINT" "$LITE_SCOPE" "$NAME" "$SYNC_FILE"
+      done
+      ;;
+    *)
+      echo "Unknown type: $TYPE"
+      ;;
+  esac
 done
 
 DEPLOY_END=$(date +%s)
 echo "Sync functions deployment took $((DEPLOY_END - DEPLOY_START))s"
 
-# Run resync flows
-resync_flow "$MASTER_APP_ENDPOINT" "$MASTER_SCOPE" "$(jq -r ".$ENVIRONMENT.master.resyncCollections" $DEPLOY_CONFIG)"
-resync_flow "$GRANDE_APP_ENDPOINT" "$GRANDE_SCOPE" "$(jq -r ".$ENVIRONMENT.grande.resyncCollections" $DEPLOY_CONFIG)"
-resync_flow "$LITE_APP_ENDPOINT" "$LITE_SCOPE" "$(jq -r ".$ENVIRONMENT.lite.resyncCollections" $DEPLOY_CONFIG)"
+# ========== RESYNC FLOW ==========
+for TYPE in "${TYPES_TO_PROCESS[@]}"; do
+  echo "Running resync for $TYPE..."
+
+  case "$TYPE" in
+    "master")
+      resync_flow "$MASTER_APP_ENDPOINT" "$MASTER_SCOPE" "$(jq -r ".$ENVIRONMENT.master.resyncCollections" $DEPLOY_CONFIG)"
+      ;;
+    "grande")
+      resync_flow "$GRANDE_APP_ENDPOINT" "$GRANDE_SCOPE" "$(jq -r ".$ENVIRONMENT.grande.resyncCollections" $DEPLOY_CONFIG)"
+      ;;
+    "lite")
+      resync_flow "$LITE_APP_ENDPOINT" "$LITE_SCOPE" "$(jq -r ".$ENVIRONMENT.lite.resyncCollections" $DEPLOY_CONFIG)"
+      ;;
+    *)
+      echo "Unknown type for resync: $TYPE"
+      ;;
+  esac
+done
 
 echo "Deployment completed"
