@@ -1,0 +1,32 @@
+{
+    "name": "treatment-billing-ready-mongo-source-connector112311119",
+    "config": {
+        "connector.class": "com.couchbase.connect.kafka.CouchbaseSourceConnector",
+        "tasks.max": "1",
+        "couchbase.topic": "path.billing.report",
+        "couchbase.seed.nodes": "couchbases://cb.wf6ax-4hcobxv2w.cloud.couchbase.com",
+        "couchbase.bootstrap.timeout": "60s",
+        "couchbase.bucket": "Path_Lite_Dev3",
+        "couchbase.collections": "treatment.Reports",
+        "couchbase.enable.tls":"true",
+        "couchbase.trust.certificate.path":"C:\\Temp\\kafka_2.13-3.9.1\\config\\certs\\PATH-DEV-root-certificate.txt",
+        "couchbase.username": "mt-dev",
+        "couchbase.password": "D@v!t@2025",
+        "couchbase.source.handler": "com.couchbase.connect.kafka.handler.source.RawJsonSourceHandler",
+        "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "value.converter.schemas.enable":"false",
+        "couchbase.stream.from": "SAVED_OFFSET_OR_BEGINNING",
+        "couchbase.compression": "ENABLED",
+        "couchbase.flow.control.buffer": "64m",
+        "couchbase.persistence.polling.interval": "100ms",
+        "transforms": "filterDocs,dropFields",
+        "transforms.filterDocs.type": "com.example.kafka.connect.transforms.ConditionalDocumentFilter",
+        "transforms.filterDocs.couchbase.conditional.filter.expr": "displayStatus == 'Posted To Kafka' && reportType == 'Billing_Report' && billingData.BILLING != null && _modifiedBy !=null && isAmended != false && isAmended != null ",
+        "transforms.dropFields.type":"org.apache.kafka.connect.transforms.ReplaceField$Value",
+        "transforms.dropFields.blacklist":"_id,submittedBy,metadata,attachment,lastUpdated",
+        "errors.tolerance": "all",
+        "errors.log.enable": "true",
+        "errors.log.include.messages": "true"
+    }
+}
