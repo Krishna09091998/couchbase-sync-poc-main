@@ -20,40 +20,40 @@ console.log("Config:", config);
 const SRC_DIR = path.join(__dirname, "../src");
 
 // Get changed files using git diff compared to main branch varies depedning on envoirment in real time
-function getChangedFiles() {
-  try {
-    const output = execSync("git diff --name-only main", { encoding: "utf-8" });
-    return output
-      .split("\n")
-      .filter(
-        file =>
-          file.endsWith(".js") &&
-          file.startsWith("src" + path.sep)
-      )
-      .map(file => path.resolve(file));
-  } catch (err) {
-    console.error("Error getting git diff:", err.message);
-    return [];
-  }
-}
+// function getChangedFiles() {
+//   try {
+//     const output = execSync("git diff --name-only main", { encoding: "utf-8" });
+//     return output
+//       .split("\n")
+//       .filter(
+//         file =>
+//           file.endsWith(".js") &&
+//           file.startsWith("src" + path.sep)
+//       )
+//       .map(file => path.resolve(file));
+//   } catch (err) {
+//     console.error("Error getting git diff:", err.message);
+//     return [];
+//   }
+// }
 
 /** 
  * Recursively get all JavaScript files from a directory and its subdirectories.
  * @param {string} dir - The directory path to scan.
  * @returns {string[]} - Array of full paths to all .js files found.
  */
-function getAllJsFiles(dir) {
-  let files = [];
-  fs.readdirSync(dir).forEach(file => {
-    const fullPath = path.join(dir, file);
-    if (fs.statSync(fullPath).isDirectory()) {
-      files = files.concat(getAllJsFiles(fullPath));
-    } else if (file.endsWith(".js")) {
-      files.push(fullPath);
-    }
-  });
-  return files;
-}
+// function getAllJsFiles(dir) {
+//   let files = [];
+//   fs.readdirSync(dir).forEach(file => {
+//     const fullPath = path.join(dir, file);
+//     if (fs.statSync(fullPath).isDirectory()) {
+//       files = files.concat(getAllJsFiles(fullPath));
+//     } else if (file.endsWith(".js")) {
+//       files.push(fullPath);
+//     }
+//   });
+//   return files;
+// }
 
 /**
  * Construct the Couchbase App Services endpoint URL for a JS file.
@@ -104,12 +104,12 @@ if (code.startsWith("module.exports")) {
 
   try {
     await fetch(url, {
-  method: "PUT",
+  method: "POST",
   headers: {
     "Authorization": `Bearer ${config.apiKey}`,
     "Content-Type": "application/json",
   },
-  body: payload, // raw function, no stringify
+//  body: payload, // raw function, no stringify
 });
     console.log(`✅ Deployed: ${filePath}`);
   } catch (err) {
