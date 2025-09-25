@@ -28,35 +28,46 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
     @Override
     public R apply(R record) {
         if (record.value() == null) {
+            log.info("Record value is null, skipping key={}", record.key());
             return null;
         }
+
+        log.info("Applying filter to record key={} value type={}", record.key(), record.value().getClass());
+
         try {
             JsonNode docNode;
             Object value = record.value();
 
+            // Detect the type of record value
             if (value instanceof byte[]) {
+                log.info("Record value is byte[], parsing to JSON string");
                 String jsonString = new String((byte[]) value, StandardCharsets.UTF_8);
+                log.info("Raw JSON string: {}", jsonString);
                 docNode = mapper.readTree(jsonString);
             } else if (value instanceof String) {
+                log.info("Record value is String, parsing to JSON");
+                log.info("Raw string: {}", value);
                 docNode = mapper.readTree((String) value);
             } else if (value instanceof Map) {
+                log.info("Record value is Map, converting to JsonNode");
                 docNode = mapper.valueToTree(value);
+                log.info("Converted Map to JsonNode");
             } else {
                 log.info("Unsupported record value type: {}", value.getClass());
                 return record;
             }
 
-            // --- Flatten into JEXL context ---
+            // Flatten JSON into JEXL context
             JexlContext context = new MapContext();
+            log.info("Flattening JSON into JEXL context for record key={}", record.key());
             flattenJson("", docNode, context);
 
-            // INFO log of JEXL context
-            log.info("JEXL Context Variables: {}", ((MapContext) context).getMap());
-
-            // --- Evaluate Expression ---
+            // Evaluate JEXL expression
             Boolean result = (Boolean) expression.evaluate(context);
+            log.info("JEXL expression evaluated to {} for record key={}", result, record.key());
+
             if (Boolean.FALSE.equals(result)) {
-                log.info("Record filtered out by expression: {}", record.key());
+                log.info("Record filtered out by expression, key={}", record.key());
                 return null;
             }
 
@@ -72,14 +83,12 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
                     record.timestamp()
             );
 
-            // INFO log for final passing record
-            log.info("Record passed filter: topic={} key={} value={}", 
-                     newRecord.topic(), newRecord.key(), mapValue);
+            log.info("Record passed filter, producing new record: key={} value={}", record.key(), mapValue);
 
             return newRecord;
 
         } catch (Exception e) {
-            log.info("Error applying filter to record: {}", record, e);
+            log.info("Error applying filter to record key={}", record.key(), e);
             return null;
         }
     }
@@ -106,11 +115,12 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
         log.info("Initialized conditional document filter with expression: {}", exprString);
     }
 
-    // Helper method to flatten JSON into JEXL context
+    // Recursive helper to flatten JSON into JEXL context
     private void flattenJson(String prefix, JsonNode node, JexlContext ctx) {
         if (node.isObject()) {
             if (!prefix.isEmpty()) {
-                ctx.set(prefix, true); // mark object itself as present
+                ctx.set(prefix, true); // object presence
+                log.info("Flattened object key={} as present", prefix);
             }
             node.fieldNames().forEachRemaining(fieldName -> {
                 String key = prefix.isEmpty() ? fieldName : prefix + "." + fieldName;
@@ -118,7 +128,8 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
             });
         } else if (node.isArray()) {
             if (!prefix.isEmpty()) {
-                ctx.set(prefix, true); // mark array itself as present
+                ctx.set(prefix, true); // array presence
+                log.info("Flattened array key={} as present", prefix);
             }
             int index = 0;
             for (JsonNode element : node) {
@@ -127,16 +138,14 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
                 index++;
             }
         } else {
-            // Leaf values only
-            if (node.isBoolean()) {
-                ctx.set(prefix, node.booleanValue());
-            } else if (node.isNumber()) {
-                ctx.set(prefix, node.numberValue());
-            } else if (node.isTextual()) {
-                ctx.set(prefix, node.textValue());
-            } else if (node.isNull()) {
-                ctx.set(prefix, null);
-            }
+            Object value = null;
+            if (node.isBoolean()) value = node.booleanValue();
+            else if (node.isNumber()) value = node.numberValue();
+            else if (node.isTextual()) value = node.textValue();
+            else if (node.isNull()) value = null;
+
+            ctx.set(prefix, value);
+            log.info("Flattened leaf key={} value={}", prefix, value);
         }
     }
 }
