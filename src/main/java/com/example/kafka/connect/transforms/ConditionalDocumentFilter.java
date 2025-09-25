@@ -5,11 +5,11 @@ import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.ObjectMappe
 import org.apache.commons.jexl3.JexlContext;
 import org.apache.commons.jexl3.MapContext;
 import org.apache.commons.jexl3.JexlExpression;
+import org.apache.commons.jexl3.JexlBuilder;
+import org.apache.commons.jexl3.JexlEngine;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.connector.ConnectRecord;
 import org.apache.kafka.connect.transforms.Transformation;
-import org.apache.commons.jexl3.JexlBuilder;
-import org.apache.commons.jexl3.JexlEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import java.util.Map;
@@ -31,51 +31,55 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
             return null;
         }
         try {
-            JsonNode docNode = null ;
-            // ---parse record value into JsonNode---
+            JsonNode docNode;
             Object value = record.value();
-            log.info("Record value class :{}", value != null ? value.getClass().getName() : "null");
-            if(value instanceof byte[]){
-                String jsonString =new String((byte[]) value, StandardCharsets.UTF_8);
+
+            if (value instanceof byte[]) {
+                String jsonString = new String((byte[]) value, StandardCharsets.UTF_8);
                 docNode = mapper.readTree(jsonString);
-                log.info("parsed record value from byte[]:{}",jsonString);
-            }else if (value instanceof String){
+            } else if (value instanceof String) {
                 docNode = mapper.readTree((String) value);
-                log.info("parsed record value from string[]:{}",value);
-            }else if (value instanceof Map){
+            } else if (value instanceof Map) {
                 docNode = mapper.valueToTree(value);
-                log.info("parsed record value from map[]:{}",value);
-            }else {
-                log.warn("Unsupported record value type : {}", value.getClass());
+            } else {
+                log.info("Unsupported record value type: {}", value.getClass());
                 return record;
             }
+
             // --- Flatten into JEXL context ---
             JexlContext context = new MapContext();
             flattenJson("", docNode, context);
-            
-            // ---Evaluate Expression ---
+
+            // INFO log of JEXL context
+            log.info("JEXL Context Variables: {}", ((MapContext) context).getMap());
+
+            // --- Evaluate Expression ---
             Boolean result = (Boolean) expression.evaluate(context);
-            if(Boolean.FALSE.equals(result)){
-                return null ;
+            if (Boolean.FALSE.equals(result)) {
+                log.info("Record filtered out by expression: {}", record.key());
+                return null;
             }
 
-        //convert jsonNode back to map for downstream SMTs
-
-        Map<String, Object> mapValue =mapper.convertValue(docNode,Map.class);
-        R newRecord = (R) record.newRecord(
-            record.topic(),
-            record.kafkaPartition(),
-            record.keySchema(),
-            record.key(),
-            null,
-            mapValue,
-            record.timestamp()
+            // Convert JsonNode back to Map for downstream SMTs
+            Map<String, Object> mapValue = mapper.convertValue(docNode, Map.class);
+            R newRecord = (R) record.newRecord(
+                    record.topic(),
+                    record.kafkaPartition(),
+                    record.keySchema(),
+                    record.key(),
+                    null,
+                    mapValue,
+                    record.timestamp()
             );
-            log.info("New Record : {}",newRecord );
-        return newRecord;
+
+            // INFO log for final passing record
+            log.info("Record passed filter: topic={} key={} value={}", 
+                     newRecord.topic(), newRecord.key(), mapValue);
+
+            return newRecord;
 
         } catch (Exception e) {
-            log.error("Error applying filter to record: " + record, e);
+            log.info("Error applying filter to record: {}", record, e);
             return null;
         }
     }
@@ -105,19 +109,25 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
     // Helper method to flatten JSON into JEXL context
     private void flattenJson(String prefix, JsonNode node, JexlContext ctx) {
         if (node.isObject()) {
-            ctx.set(prefix,node.toString());
+            if (!prefix.isEmpty()) {
+                ctx.set(prefix, true); // mark object itself as present
+            }
             node.fieldNames().forEachRemaining(fieldName -> {
                 String key = prefix.isEmpty() ? fieldName : prefix + "." + fieldName;
                 flattenJson(key, node.get(fieldName), ctx);
             });
         } else if (node.isArray()) {
-            ctx.set(prefix,node.toString());
+            if (!prefix.isEmpty()) {
+                ctx.set(prefix, true); // mark array itself as present
+            }
             int index = 0;
             for (JsonNode element : node) {
-                flattenJson(prefix + "[" + index + "]", element, ctx);
+                String key = prefix + "[" + index + "]";
+                flattenJson(key, element, ctx);
                 index++;
             }
         } else {
+            // Leaf values only
             if (node.isBoolean()) {
                 ctx.set(prefix, node.booleanValue());
             } else if (node.isNumber()) {
@@ -128,6 +138,5 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
                 ctx.set(prefix, null);
             }
         }
-        log.info("Flattened key ={} value {}",prefix, ctx.has(prefix) ? ctx.get(prefix) : null);
     }
 }
