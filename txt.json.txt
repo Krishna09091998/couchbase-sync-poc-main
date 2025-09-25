@@ -27,6 +27,27 @@
         "transforms.dropFields.blacklist":"_id,submittedBy,metadata,attachment,lastUpdated",
         "errors.tolerance": "all",
         "errors.log.enable": "true",
-        "errors.log.include.messages": "true"
+        "errors.log.include.messages": "true",
+        "[{\"$match\":{\"$and\":[{\"fullDocument.id\":{\"$ne\":null}}
+      ,{\"fullDocument.sqlDataMoved\":{\"$exists\":false}}
+      ,{\"$or\":[{\"fullDocument.txStatusTracker\":{\"$exists\":false}},
+      {\"$and\":[{\"fullDocument.txStatusTracker.current.value\":{\"$ne\":null}},
+      {\"fullDocument.txStatusTracker.current.value\":{\"$ne\":\"none\"}}]}]}]}},
+      {\"$project\":{\"fullDocument._id\":0,\"fullDocument.statusTracker\":0,\
+      "fullDocument.practitioner\":0,\"fullDocument.hospital\":0,\"fullDocument.serviceType\":0,
+      \"fullDocument.patientDetails\":0,\"fullDocument.order\":0,
+      \"fullDocument.waitTime\":0,\"fullDocument.equipment\":0,
+      \"fullDocument.preTxDetails\":0,\"fullDocument.patientEducation\":0,
+      \"fullDocument.timeoutSafetyCheck\":0,\"fullDocument.NonTxService\":0,
+      \"fullDocument.hdIntraTreatment\":0,\"fullDocument.apheresisIntraTreatment\":0,
+      \"fullDocument.pdIntraTreatment\":0,\"fullDocument.crrtIntraTreatment\":0,
+      \"fullDocument.postTxDetails\":0,\"fullDocument.reviewSubmit\":0,
+      \"fullDocument.statusRecord\":0,\"fullDocument.acoiData\":0,
+      \"fullDocument.billingOnly\":0,\"fullDocument.txStatusTracker\":0,
+      \"fullDocument.syncStatusTracker\":0,\"fullDocument._partition\":0,
+      \"fullDocument.deviceMeta\":0,\"fullDocument.enteredInError\":0,
+      \"fullDocument.parentReference\":0,\"fullDocument.reasonType\":0,
+      \"fullDocument._modifiedTS\":0}}]"
+
     }
 }
