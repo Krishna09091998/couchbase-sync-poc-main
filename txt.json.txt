@@ -37,3 +37,50 @@
         "errors.log.include.messages": "true"
     }
 }
+
+Couchbase DCP stream reads from treatment.Encounter.
+
+CustomFilter filters documents by "type": "order".
+
+ConditionalDocumentFilter applies logical expression to refine further.
+
+ReplaceField SMT removes unwanted fields.
+
+RawJsonSourceHandler emits final JSON to Kafka.
+
+Kafka topic path.treatment.sql.data receives clean, filtered documents.
+
+
+Data Source (Couchbase)
+
+Connector reads documents from Path_Lite_Dev3 → treatment.Encounter collection.
+
+TLS is enabled using root cert.
+
+Custom Event Filter (Java + RocksDB)
+
+Each document is hashed.
+
+RocksDB stores previous hash values per document ID.
+
+If hash is same → skip event (duplicate).
+
+If new or changed → forward to Kafka.
+
+Special cases:
+
+id missing → skipped (invalid doc).
+
+First insert (not in RocksDB) → allowed.
+
+Transforms (Kafka SMTs)
+
+filterDocs: Uses expression filter → only passes docs with id != null and txStatusTracker == 'none' or null.
+
+dropFields: Removes sensitive/unnecessary fields before writing to Kafka.
+
+Kafka Topic Publishing
+
+Final JSON written into topic: path.treatment.sql.data.
+
+Consumers can now pick up a clean, deduplicated, filtered event stream.
