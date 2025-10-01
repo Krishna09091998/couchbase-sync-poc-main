@@ -7,93 +7,98 @@ import org.rocksdb.RocksDBException;
 import com.couchbase.client.java.json.JsonObject;
 
 /**
- * CustomFilter.java (modified)
+ * VersionDedupFilter.java
  *
- * Filters Couchbase change events by maintaining a key->version
- * map in RocksDB. Events with the same key and version as previously
- * seen are ignored.
+ * Final, production-ready filter with RocksDB version deduplication.
+ * Prevents duplicate processing of documents based on key + version.
  */
-public class CustomFilter {
+public final class VersionDedupFilter extends CustomFilter {
 
     private RocksDB db;
     private Options options;
-    private String versionField = "version"; // default version field
+    private String versionField = "version";       // field inside document
+    private String rocksDbPath = "rocksdb_store";  // default RocksDB folder
 
     static {
         RocksDB.loadLibrary();
     }
 
     /**
-     * Initialize RocksDB store and read configuration.
-     *
-     * @param props connector config properties
+     * Initialize filter and RocksDB store.
      */
+    @Override
     public void init(Map<String, String> props) {
+        super.init(props);
+
         if (props.containsKey("version.field")) {
             versionField = props.get("version.field");
         }
 
+        if (props.containsKey("rocksdb.path")) {
+            rocksDbPath = props.get("rocksdb.path");
+        }
+
         try {
             options = new Options().setCreateIfMissing(true);
-            db = RocksDB.open(options, "rocksdb_store"); // folder for RocksDB files
+            db = RocksDB.open(options, rocksDbPath);
         } catch (RocksDBException e) {
-            throw new RuntimeException("Error initializing RocksDB", e);
+            throw new RuntimeException("Error initializing RocksDB at path: " + rocksDbPath, e);
         }
     }
 
     /**
-     * Filter method called for each document change.
-     *
-     * @param document the Couchbase document as an Object
-     * @return true to process, false to ignore
+     * Filter each Couchbase document.
+     * Returns false if the same key+version was already processed.
      */
+    @Override
     public boolean filter(Object document) {
-        if (document == null) {
-            return true; // allow null events
-        }
+        boolean shouldProcess = super.filter(document);
+        if (!shouldProcess) return false;
 
-        // Attempt to cast document to JsonObject if possible
-        JsonObject json;
-        if (document instanceof JsonObject) {
-            json = (JsonObject) document;
-        } else {
-            // If it’s not a JsonObject, cannot filter by version
-            return true;
-        }
+        if (!(document instanceof JsonObject)) return true;
 
-        if (!json.containsKey(versionField)) {
-            return true; // allow if no version info
-        }
+        JsonObject json = (JsonObject) document;
+        String key = getKey(json);
+        int version = getVersion(json);
 
-        String key = json.getString("id"); // adjust if key is stored elsewhere
-        int version = json.getInt(versionField);
+        if (key == null) return true;
+        if (version < 0) return true;
 
         try {
             byte[] existing = db.get(key.getBytes());
-
             if (existing != null) {
                 int storedVersion = Integer.parseInt(new String(existing));
-                if (storedVersion >= version) {
-                    // Already processed → ignore
-                    return false;
-                }
+                if (storedVersion >= version) return false; // duplicate
             }
-
-            // Update RocksDB with latest version
             db.put(key.getBytes(), String.valueOf(version).getBytes());
-
         } catch (RocksDBException e) {
             throw new RuntimeException("Error accessing RocksDB", e);
         }
 
-        return true; // process event
+        return true;
     }
 
     /**
      * Close RocksDB on connector shutdown.
      */
+    @Override
     public void close() {
+        super.close();
         if (db != null) db.close();
         if (options != null) options.close();
+    }
+
+    // ---------------- Helper methods ----------------
+
+    /** Extract document key (id) from JsonObject */
+    private String getKey(JsonObject json) {
+        if (!json.containsKey("id")) return null;
+        return json.getString("id");
+    }
+
+    /** Extract document version from JsonObject */
+    private int getVersion(JsonObject json) {
+        if (!json.containsKey(versionField)) return -1;
+        return json.getInt(versionField);
     }
 }
