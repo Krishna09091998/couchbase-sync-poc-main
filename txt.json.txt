@@ -1,17 +1,22 @@
-{
-    "name": "treatment-billing-ready-mongo-source-connector112311119",
+
+  {
+    "name": "treatment-sql-data-ready-couchbase-source-connector1",
     "config": {
         "connector.class": "com.couchbase.connect.kafka.CouchbaseSourceConnector",
         "tasks.max": "1",
-        "couchbase.topic": "path.billing.report",
+        "couchbase.topic": "path.treatment.sql.data",
         "couchbase.seed.nodes": "couchbases://cb.wf6ax-4hcobxv2w.cloud.couchbase.com",
         "couchbase.bootstrap.timeout": "60s",
         "couchbase.bucket": "Path_Lite_Dev3",
-        "couchbase.collections": "treatment.Reports",
-        "couchbase.enable.tls":"true",
-        "couchbase.trust.certificate.path":"C:\\Temp\\kafka_2.13-3.9.1\\config\\certs\\PATH-DEV-root-certificate.txt",
+        "couchbase.collections": "treatment.Encounter",
+       "couchbase.enable.tls":"true",
+       "couchbase.trust.certificate.path":"C:\\Temp\\kafka_2.13-3.9.1\\config\\certs\\PATH-DEV-root-certificate.txt",
         "couchbase.username": "mt-dev",
         "couchbase.password": "D@v!t@2025",
+        //custom fikter for events 
+        "couchbase.event.filter":"com.couchbase.connect.kafka.example.CustomFilter",
+        "couchbase.custom.filter.rocksdb.path":"C:/Temp/rocksdb_store",
+        
         "couchbase.source.handler": "com.couchbase.connect.kafka.handler.source.RawJsonSourceHandler",
         "key.converter": "org.apache.kafka.connect.storage.StringConverter",
         "value.converter": "org.apache.kafka.connect.json.JsonConverter",
@@ -20,34 +25,15 @@
         "couchbase.compression": "ENABLED",
         "couchbase.flow.control.buffer": "64m",
         "couchbase.persistence.polling.interval": "100ms",
-        "transforms": "filterDocs,dropFields",
-        "transforms.filterDocs.type": "com.example.kafka.connect.transforms.ConditionalDocumentFilter",
-        "transforms.filterDocs.couchbase.conditional.filter.expr": "displayStatus == 'Posted To Kafka' && reportType == 'Billing_Report' && billingData.BILLING != null && _modifiedBy !=null && isAmended != false && isAmended != null ",
+        //configuration for custom tranforms
+         "transforms": "filterDocs,dropFields",
+         "transforms.filterDocs.type": "com.example.kafka.connect.transforms.ConditionalDocumentFilter",
+         "transforms.filterDocs.couchbase.conditional.filter.expr": "id != null && (txStatusTracker == null || ( txStatusTracker.current.value != null && txStatusTracker.current.value == 'none'))",
+         //configuration to drop the feilds ( couchbase inbuilt SMT only accepts MAP)
         "transforms.dropFields.type":"org.apache.kafka.connect.transforms.ReplaceField$Value",
-        "transforms.dropFields.blacklist":"_id,submittedBy,metadata,attachment,lastUpdated",
+        "transforms.dropFields.blacklist":"txStatusTracker,practitioner,hospital,serviceType,demographicsAndAdmission,order,txWaitTimeList,preTxDetails,patientEducation,timeoutSafteryCheck,NonTxService,hdIntraTreatment,aphresisIntraTreatment,pdIntraTreatment,aphersisIntraTreatment,pdIntraTreatment,crrIntraTreatment,postTxDetails,reviewSubmit,statusRecord,acoiData,billingOnly,txStatusTracker,syncStatusTracker,_partition,deviceMeta,enteredInError,parentReference,reasonType,_modifiedBy",
         "errors.tolerance": "all",
         "errors.log.enable": "true",
-        "errors.log.include.messages": "true",
-        "[{\"$match\":{\"$and\":[{\"fullDocument.id\":{\"$ne\":null}}
-      ,{\"fullDocument.sqlDataMoved\":{\"$exists\":false}}
-      ,{\"$or\":[{\"fullDocument.txStatusTracker\":{\"$exists\":false}},
-      {\"$and\":[{\"fullDocument.txStatusTracker.current.value\":{\"$ne\":null}},
-      {\"fullDocument.txStatusTracker.current.value\":{\"$ne\":\"none\"}}]}]}]}},
-      {\"$project\":{\"fullDocument._id\":0,\"fullDocument.statusTracker\":0,\
-      "fullDocument.practitioner\":0,\"fullDocument.hospital\":0,\"fullDocument.serviceType\":0,
-      \"fullDocument.patientDetails\":0,\"fullDocument.order\":0,
-      \"fullDocument.waitTime\":0,\"fullDocument.equipment\":0,
-      \"fullDocument.preTxDetails\":0,\"fullDocument.patientEducation\":0,
-      \"fullDocument.timeoutSafetyCheck\":0,\"fullDocument.NonTxService\":0,
-      \"fullDocument.hdIntraTreatment\":0,\"fullDocument.apheresisIntraTreatment\":0,
-      \"fullDocument.pdIntraTreatment\":0,\"fullDocument.crrtIntraTreatment\":0,
-      \"fullDocument.postTxDetails\":0,\"fullDocument.reviewSubmit\":0,
-      \"fullDocument.statusRecord\":0,\"fullDocument.acoiData\":0,
-      \"fullDocument.billingOnly\":0,\"fullDocument.txStatusTracker\":0,
-      \"fullDocument.syncStatusTracker\":0,\"fullDocument._partition\":0,
-      \"fullDocument.deviceMeta\":0,\"fullDocument.enteredInError\":0,
-      \"fullDocument.parentReference\":0,\"fullDocument.reasonType\":0,
-      \"fullDocument._modifiedTS\":0}}]"
-
+        "errors.log.include.messages": "true"
     }
 }
