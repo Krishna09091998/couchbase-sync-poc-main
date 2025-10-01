@@ -1,6 +1,5 @@
 package com.couchbase.connect.kafka.example;
 
-import com.couchbase.client.java.json.JsonObject;
 import com.couchbase.connect.kafka.filter.Filter;
 import com.couchbase.connect.kafka.handler.source.DocumentEvent;
 import org.apache.kafka.common.config.AbstractConfig;
@@ -11,99 +10,80 @@ import org.rocksdb.RocksDBException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Map;
 
-/**
- * CustomFilter for RocksDB version deduplication.
- */
 public class CustomFilter implements Filter {
     private static final Logger log = LoggerFactory.getLogger(CustomFilter.class);
 
-    private static final String VERSION_FIELD_PROPERTY = "couchbase.custom.filter.version.field";
-    private static final String ROCKSDB_PATH_PROPERTY = "couchbase.custom.filter.rocksdb.path";
+    private static final String ROCKSDB_PATH = "couchbase.custom.filter.rocksdb.path";
 
     private static final ConfigDef configDef = new ConfigDef()
-            .define(VERSION_FIELD_PROPERTY,
+            .define(ROCKSDB_PATH,
                     ConfigDef.Type.STRING,
-                    "version",
+                    "/tmp/couchbase-filter-rocksdb",
                     ConfigDef.Importance.HIGH,
-                    "Field name containing document version.")
-            .define(ROCKSDB_PATH_PROPERTY,
-                    ConfigDef.Type.STRING,
-                    "rocksdb_store",
-                    ConfigDef.Importance.HIGH,
-                    "Path for RocksDB storage.");
+                    "Path to RocksDB directory for storing doc hashes");
 
     private RocksDB db;
-    private Options options;
-    private String versionField;
-    private String rocksDbPath;
-
-    static {
-        RocksDB.loadLibrary();
-    }
+    private MessageDigest digest;
 
     @Override
     public void init(Map<String, String> configProperties) {
         AbstractConfig config = new AbstractConfig(configDef, configProperties);
-        versionField = config.getString(VERSION_FIELD_PROPERTY);
-        rocksDbPath = config.getString(ROCKSDB_PATH_PROPERTY);
-
-        log.info("Initializing RocksDB deduplication: versionField='{}', path='{}'", versionField, rocksDbPath);
+        String rocksPath = config.getString(ROCKSDB_PATH);
 
         try {
-            options = new Options().setCreateIfMissing(true);
-            db = RocksDB.open(options, rocksDbPath);
-        } catch (RocksDBException e) {
-            throw new RuntimeException("Failed to open RocksDB at path: " + rocksDbPath, e);
+            RocksDB.loadLibrary();
+            Options options = new Options().setCreateIfMissing(true);
+            db = RocksDB.open(options, rocksPath);
+            digest = MessageDigest.getInstance("SHA-256");  // or "MD5"/"MurmurHash"
+            log.info("CustomFilter initialized with RocksDB at {}", rocksPath);
+        } catch (RocksDBException | NoSuchAlgorithmException e) {
+            throw new RuntimeException("Failed to initialize CustomFilter", e);
         }
     }
 
     @Override
     public boolean pass(DocumentEvent event) {
         if (!event.isMutation()) {
-            log.debug("Skipping non-mutation event: {}", event);
-            return true;
+            log.debug("Skipping non-mutation event {}", event);
+            return false;
         }
 
         try {
-            JsonObject json = JsonObject.fromJson(event.content());
-            log.info("Processing document: id={}, content={}", json.getString("id"), json);
+            String docId = event.key(); // Couchbase doc ID
+            byte[] body = event.content();
 
-            String key = json.containsKey("id") ? json.getString("id") : null;
-            if (key == null) {
-                log.warn("Document has no 'id' field, passing through: {}", json);
+            // Compute hash of body
+            byte[] newHash = digest.digest(body);
+
+            // Lookup old hash
+            byte[] oldHash = db.get(docId.getBytes(StandardCharsets.UTF_8));
+
+            if (oldHash == null) {
+                // First time seeing this doc
+                db.put(docId.getBytes(StandardCharsets.UTF_8), newHash);
+                log.info("Accepting new document '{}'", docId);
                 return true;
             }
 
-            int version = json.containsKey(versionField) ? json.getInt(versionField) : -1;
-            if (version < 0) {
-                log.warn("Document has no '{}' field or invalid version, passing through: {}", versionField, json);
+            if (MessageDigest.isEqual(oldHash, newHash)) {
+                // Duplicate, skip
+                log.info("Rejecting unchanged document '{}'", docId);
+                return false;
+            } else {
+                // Changed, update hash
+                db.put(docId.getBytes(StandardCharsets.UTF_8), newHash);
+                log.info("Accepting updated document '{}'", docId);
                 return true;
             }
-
-            // Ignore Couchbase metadata keys
-            if (key.startsWith("_") || key.equals("$document")) {
-                log.debug("Ignoring internal metadata key: {}", key);
-                return true;
-            }
-
-            byte[] existing = db.get(key.getBytes());
-            if (existing != null) {
-                int storedVersion = Integer.parseInt(new String(existing));
-                if (storedVersion >= version) {
-                    log.info("Skipping duplicate document: id={}, version={}, storedVersion={}", key, version, storedVersion);
-                    return false;
-                }
-            }
-
-            db.put(key.getBytes(), String.valueOf(version).getBytes());
-            log.info("Accepted document: id={}, version={}", key, version);
 
         } catch (Exception e) {
-            log.error("Error processing document for RocksDB deduplication: {}", event, e);
+            log.error("Error filtering event {}", event, e);
+            return true; // Fail open
         }
-
-        return true;
     }
 }
