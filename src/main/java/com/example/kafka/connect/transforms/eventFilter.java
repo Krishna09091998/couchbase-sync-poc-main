@@ -1,85 +1,99 @@
 package com.couchbase.connect.kafka.example;
 
-import com.couchbase.connect.kafka.filter.Filter;
-import org.apache.kafka.connect.source.SourceRecord;
-import org.rocksdb.*;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.util.Map;
+import org.rocksdb.Options;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
+import com.couchbase.client.java.json.JsonObject;
 
 /**
- * A custom Couchbase Kafka Source Connector event filter that suppresses duplicate events
- * by comparing a version field (e.g., mutationCounter) using RocksDB as a local state store.
+ * CustomFilter.java (modified)
+ *
+ * Filters Couchbase change events by maintaining a key->version
+ * map in RocksDB. Events with the same key and version as previously
+ * seen are ignored.
  */
-public class VersionFilter implements Filter {
-    private static final Logger LOGGER = LoggerFactory.getLogger(VersionFilter.class);
-    private RocksDB db;
-    private final String dbPath = "/tmp/version-filter-db";
+public class CustomFilter {
 
-    @Override
-    public void configure(Map<String, String> config) {
+    private RocksDB db;
+    private Options options;
+    private String versionField = "version"; // default version field
+
+    static {
+        RocksDB.loadLibrary();
+    }
+
+    /**
+     * Initialize RocksDB store and read configuration.
+     *
+     * @param props connector config properties
+     */
+    public void init(Map<String, String> props) {
+        if (props.containsKey("version.field")) {
+            versionField = props.get("version.field");
+        }
+
         try {
-            RocksDB.loadLibrary();
-            Options options = new Options().setCreateIfMissing(true);
-            db = RocksDB.open(options, dbPath);
-            LOGGER.info("RocksDB initialized at {}", dbPath);
+            options = new Options().setCreateIfMissing(true);
+            db = RocksDB.open(options, "rocksdb_store"); // folder for RocksDB files
         } catch (RocksDBException e) {
-            throw new RuntimeException("Failed to initialize RocksDB", e);
+            throw new RuntimeException("Error initializing RocksDB", e);
         }
     }
 
-    @Override
-    public boolean pass(SourceRecord record) {
-        Object valueObj = record.value();
-        LOGGER.info("Received SourceRecord with value type: {}", valueObj.getClass().getName());
-        LOGGER.info("Record value: {}", valueObj);
-
-        if (!(valueObj instanceof Map)) {
-            LOGGER.warn("Unexpected value type: {}", valueObj.getClass().getName());
-            return true; // Allow non-map records through
+    /**
+     * Filter method called for each document change.
+     *
+     * @param document the Couchbase document as an Object
+     * @return true to process, false to ignore
+     */
+    public boolean filter(Object document) {
+        if (document == null) {
+            return true; // allow null events
         }
 
-        Map<String, Object> document = (Map<String, Object>) valueObj;
-        String docId = (String) document.get("id");
-        Object versionObj = document.get("mutationCounter");
-
-        if (docId == null || versionObj == null) {
-            LOGGER.warn("Missing 'id' or 'mutationCounter' in document: {}", document);
-            return true; // Allow through if missing fields
-        }
-
-        int incomingVersion;
-        try {
-            incomingVersion = Integer.parseInt(versionObj.toString());
-        } catch (NumberFormatException e) {
-            LOGGER.warn("Invalid mutationCounter format for docId={}: {}", docId, versionObj);
+        // Attempt to cast document to JsonObject if possible
+        JsonObject json;
+        if (document instanceof JsonObject) {
+            json = (JsonObject) document;
+        } else {
+            // If it’s not a JsonObject, cannot filter by version
             return true;
         }
 
-        try {
-            byte[] storedBytes = db.get(docId.getBytes());
-            int storedVersion = storedBytes == null ? -1 : Integer.parseInt(new String(storedBytes));
-
-            if (incomingVersion > storedVersion) {
-                db.put(docId.getBytes(), String.valueOf(incomingVersion).getBytes());
-                LOGGER.info("Forwarding docId={} with new version={}", docId, incomingVersion);
-                return true;
-            } else {
-                LOGGER.info("Filtered out docId={} with unchanged version={}", docId, incomingVersion);
-                return false;
-            }
-        } catch (Exception e) {
-            LOGGER.error("Error accessing RocksDB for docId={}", docId, e);
-            return true; // Fail open
+        if (!json.containsKey(versionField)) {
+            return true; // allow if no version info
         }
+
+        String key = json.getString("id"); // adjust if key is stored elsewhere
+        int version = json.getInt(versionField);
+
+        try {
+            byte[] existing = db.get(key.getBytes());
+
+            if (existing != null) {
+                int storedVersion = Integer.parseInt(new String(existing));
+                if (storedVersion >= version) {
+                    // Already processed → ignore
+                    return false;
+                }
+            }
+
+            // Update RocksDB with latest version
+            db.put(key.getBytes(), String.valueOf(version).getBytes());
+
+        } catch (RocksDBException e) {
+            throw new RuntimeException("Error accessing RocksDB", e);
+        }
+
+        return true; // process event
     }
 
-    @Override
+    /**
+     * Close RocksDB on connector shutdown.
+     */
     public void close() {
-        if (db != null) {
-            db.close();
-            LOGGER.info("RocksDB closed");
-        }
+        if (db != null) db.close();
+        if (options != null) options.close();
     }
 }
