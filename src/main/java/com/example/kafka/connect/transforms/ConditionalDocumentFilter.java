@@ -5,11 +5,11 @@ import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.ObjectMappe
 import org.apache.commons.jexl3.JexlContext;
 import org.apache.commons.jexl3.MapContext;
 import org.apache.commons.jexl3.JexlExpression;
+import org.apache.commons.jexl3.JexlBuilder;
+import org.apache.commons.jexl3.JexlEngine;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.connector.ConnectRecord;
 import org.apache.kafka.connect.transforms.Transformation;
-import org.apache.commons.jexl3.JexlBuilder;
-import org.apache.commons.jexl3.JexlEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,17 +37,14 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
             return null;
         }
 
-        log.info("Applying filter to record key={} value={}", record.key());
+        log.info("Applying filter to record key={} value type={}", record.key(), record.value().getClass());
 
         try {
             JsonNode docNode;
             Object value = record.value();
 
             // parse record value
-            if (value instanceof byte[]) {
-                String jsonString = new String((byte[]) value, StandardCharsets.UTF_8);
-                docNode = mapper.readTree(jsonString);
-                log.info("Parsed byte[] record value: {}" ,jsonString);
+            
             } else if (value instanceof String) {
                 docNode = mapper.readTree((String) value);
                 log.info("Parsed String record value");
