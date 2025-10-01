@@ -14,7 +14,7 @@ import org.slf4j.LoggerFactory;
 import java.util.Map;
 
 /**
- * CustomFilter for RocksDB version deduplication with detailed logging.
+ * CustomFilter for RocksDB version deduplication.
  */
 public class CustomFilter implements Filter {
     private static final Logger log = LoggerFactory.getLogger(CustomFilter.class);
@@ -73,13 +73,13 @@ public class CustomFilter implements Filter {
             String key = json.containsKey("id") ? json.getString("id") : null;
             if (key == null) {
                 log.warn("Document has no 'id' field, passing through: {}", json);
-                return true; // cannot dedup without key
+                return true;
             }
 
             int version = json.containsKey(versionField) ? json.getInt(versionField) : -1;
             if (version < 0) {
                 log.warn("Document has no '{}' field or invalid version, passing through: {}", versionField, json);
-                return true; // skip if no version
+                return true;
             }
 
             // Ignore Couchbase metadata keys
@@ -93,7 +93,7 @@ public class CustomFilter implements Filter {
                 int storedVersion = Integer.parseInt(new String(existing));
                 if (storedVersion >= version) {
                     log.info("Skipping duplicate document: id={}, version={}, storedVersion={}", key, version, storedVersion);
-                    return false; // duplicate, ignore event
+                    return false;
                 }
             }
 
@@ -105,16 +105,5 @@ public class CustomFilter implements Filter {
         }
 
         return true;
-    }
-
-    @Override
-    public void close() {
-        try {
-            if (db != null) db.close();
-            if (options != null) options.close();
-            log.info("Closed RocksDB for CustomFilter");
-        } catch (Exception e) {
-            log.error("Error closing RocksDB", e);
-        }
     }
 }
