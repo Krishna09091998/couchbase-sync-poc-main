@@ -10,6 +10,7 @@ import org.rocksdb.RocksDBException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -35,14 +36,41 @@ public class CustomFilter implements Filter {
         AbstractConfig config = new AbstractConfig(configDef, configProperties);
         String rocksPath = config.getString(ROCKSDB_PATH);
 
+        initRocksDB(rocksPath);
+    }
+
+    private void initRocksDB(String path) {
         try {
             RocksDB.loadLibrary();
             Options options = new Options().setCreateIfMissing(true);
-            db = RocksDB.open(options, rocksPath);
-            digest = MessageDigest.getInstance("SHA-256");  // or "MD5"/"MurmurHash"
-            log.info("CustomFilter initialized with RocksDB at {}", rocksPath);
+
+            File dbDir = new File(path);
+            File lockFile = new File(dbDir, "LOCK");
+
+            // If LOCK exists, attempt recovery
+            if (lockFile.exists()) {
+                log.warn("RocksDB LOCK file exists. Attempting to recover: {}", lockFile.getAbsolutePath());
+                if (db != null) {
+                    try {
+                        db.close(); // close any previous handle
+                        log.info("Closed existing RocksDB instance for path {}", path);
+                    } catch (Exception e) {
+                        log.error("Error closing previous RocksDB instance", e);
+                    }
+                    db = null;
+                }
+                // Delete the LOCK file
+                boolean deleted = lockFile.delete();
+                log.info("Deleted stale LOCK file: {} success={}", lockFile.getAbsolutePath(), deleted);
+            }
+
+            // Open RocksDB
+            db = RocksDB.open(options, path);
+            digest = MessageDigest.getInstance("SHA-256");
+            log.info("RocksDB initialized at {}", path);
+
         } catch (RocksDBException | NoSuchAlgorithmException e) {
-            throw new RuntimeException("Failed to initialize CustomFilter", e);
+            throw new RuntimeException("Failed to initialize RocksDB", e);
         }
     }
 
