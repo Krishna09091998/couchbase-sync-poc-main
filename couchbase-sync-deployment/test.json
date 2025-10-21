@@ -1,0 +1,582 @@
+[
+    {
+        "appcode": "function OnUpdate(doc, meta, xattrs) {\n   log('ProcedureBillingCode control OnUpdate', doc, meta.id);\n   // created enabled flag to disable the job \n   if (doc.enabled) {\n      doc['ProcedureBillingCode'] = ProcedureBillingCode;\n      doc['HospitalSupplement'] = HospitalSupplement;\n      doc['BufferTime'] = BufferTime;\n      log('ProcedureCodeBilling initialize createTimer', doc);\n      createTimer(ProcedureBillingCodeCallback, getNextRecurringDate(), doc.id, doc);\n   } else {\n      log('ProcedureCodeBilling disabled block', doc);\n      cancelTimer(ProcedureBillingCodeCallback, doc.id);\n   }\n}\n// clean up procedure code\nfunction ProcedureBillingCodeCallback(context) {\n   log('ProcedureBillingCodeCallback: timer fired', context);\n   //initialize the next timer\n   createTimer(ProcedureBillingCodeCallback, getNextRecurringDate(), context.id, context);\n\n   try {\n      // filter todate < today-60 days or hospitalId with contractEndDate < today-60 days\n      var query = `DELETE FROM ${context['ProcedureBillingCode']} \n      WHERE toDate < DATE_ADD_STR(NOW_STR(), ${context['BufferTime']}, 'day') or\n      hospitalId in \n         (SELECT DISTINCT RAW hospitalId \n         FROM ${context['HospitalSupplement']} \n         WHERE contractEndDate < DATE_ADD_STR(NOW_STR(), ${context['BufferTime']}, 'day'))`;\n\n      N1QL(query);\n      log('ProcedureBillingCodeCallback query executed');\n   } catch (e) {\n      log(e);\n   }\n}\n\n// set next day job to 00:00:00 utc\nfunction getNextRecurringDate() {\n   var currentTimestamp = new Date(); \n   log('ProcedureCodeBilling next schedule time', new Date(currentTimestamp.getFullYear(), currentTimestamp.getMonth(), currentTimestamp.getDate() + 1, 0, 0, 0));\n   return new Date(currentTimestamp.getFullYear(), currentTimestamp.getMonth(), currentTimestamp.getDate() + 1, 0, 0, 0);\n}\n\n// cancel the timer based on meta.id since doc.id and meta.id are same\nfunction OnDelete(meta, options) {\n   log('ProcedureBillingCode control OnDelete', meta.id);\n   cancelTimer(ProcedureBillingCodeCallback, meta.id);\n}",
+        "depcfg": {
+            "constants": [
+                {
+                    "value": "ProcedureBillingCode",
+                    "literal": "\"`Path_Master_Dev3`.`masterdata`.`ProcedureBillingCode`\""
+                },
+                {
+                    "value": "HospitalSupplement",
+                    "literal": "\"`Path_Master_Dev3`.`masterdata`.`HospitalSupplement`\""
+                },
+                {
+                    "value": "BufferTime",
+                    "literal": "-60"
+                }
+            ],
+            "source_bucket": "Path_Master_Dev3",
+            "source_scope": "_default",
+            "source_collection": "procedureBillingCodeControl",
+            "metadata_bucket": "Path_Master_Dev3",
+            "metadata_scope": "_default",
+            "metadata_collection": "procedureBillingCodeMetaData"
+        },
+        "version": "evt-7.6.6-6126-ee",
+        "enforce_schema": false,
+        "handleruuid": 230519080,
+        "function_instance_id": "2nbFm1",
+        "appname": "CleanupProcedureCodeBilling",
+        "settings": {
+            "allow_sync_documents": true,
+            "cursorAware": false,
+            "cursor_aware": false,
+            "dcp_stream_boundary": "everything",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "delete expired ProcedureCodeBilling",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    },
+    {
+        "appcode": "/**\n * Eventing Function: patientRecallFull\n *\n * Purpose:\n *   - Listens to PatientTreatment inserts/updates.\n *   - Ensures patient has a PatientRecallInfo record.(If doesn't exist creat new one):\n *   - Adds new treatment reports to PatientRecallInfo.\n *   - Handles parent treatments like CRRT/PD.\n *\n * Bindings Required:\n *   - src_col     (Read/Write) → PatientTreatment\n *   - recall_col  (Read/Write) → PatientRecallInfo\n */\n\n/*===========================================================\n * Main Eventing Handler\n ========================================================= */\nfunction OnUpdate(doc, meta, xattrs) {\n    if (!doc) return; // skip deletes\n\n    log(\"Triggered for PatientTreatment id=\" + meta.id);\n\n    //   Validate status\n    if (!isValidStatus(doc)) {\n        log(\"Doc \" + meta.id + \" skipped: invalid processedStatus/amendmentDisplayStatus.\");\n        return;\n    }\n\n    // 2️ Check recall eligibility\n    if (!isRecallEligible(doc)) {\n        log(\"Doc \" + meta.id + \" skipped: not eligible for recall.\");\n        return;\n    }\n\n    // 3️ Fetch the parent document if exists (PD, CRRT)\n    let parentDoc = doc; // using self doc as fallback if parentDoc doesn't exist\n    if(doc.parent && doc.parent.id){\n        parentDoc = fetchParentDoc(doc.parent.id);\n        if(!parentDoc){\n            log(`parent record not found for child ${meta.id} with parentId =${doc.parent.id}, using self as fallback`);\n        }\n\n    }\n\n    // 4️ Fetch matching treatment report\n    var reportDoc = findMatchingReport(doc);\n    if (!reportDoc) {\n        log(\"No valid report found for encounterId=\" + doc.encounterId);\n        return;\n    }\n\n    // 5️ Find or create PatientRecallInfo using patient identity\n    var recallData = fetchOrCreateRecall(parentDoc);\n    var patientRecallInfoId = recallData.patientRecallInfoId;\n    var patRecallDoc = recallData.patRecallDoc;\n\n    // 6️ Build treatmentReportInfo entry\n    var treatmentReportEntry = buildTreatmentReportEntry(parentDoc, reportDoc);\n\n    // 7️ Upsert PatientRecallInfo (deduplicate reports)\n    upsertRecall(patientRecallInfoId, patRecallDoc, treatmentReportEntry, parentDoc);\n\n    // 8️ Link PatientTreatment --> PatientRecallInfo\n    linkTreatmentToRecall(meta.id, doc, patientRecallInfoId);\n\n    //9 If doc has a parent , also link parent treatment to same patientRecallInfoId:\n    if(doc.parent && doc.parent.id ){\n        log(`child ${meta.id} +\" has a parent -> linking parent ${doc.parent.id} to recall ${patientRecallInfoId}`);\n        // linkTreatmentToRecall(doc.parent.id, {patientRecallInfoId: null}, patientRecallInfoId);\n        try{\n            var parentRecord = fetchParentDoc(doc.parent.id);\n            linkTreatmentToRecall(doc.parent.id, parentRecord, patientRecallInfoId);\n        }catch(err){\n             log(\"While updating the PatientRecallInfoId in the parent Doc, Error fetching parent document with id: \" + parentId + \": \" + JSON.stringify(err));\n        }\n        \n    }\n}\n\n/*==========================================================\n * Helper Functions\n ==========================================================*/\n\n//   Validate processed/amendment status\nfunction isValidStatus(doc) {\n    var validProcessedStatuses = [\"submitted\"];\n    var validAmendmentStatuses = [\"amendment-submitted\"];\n\n    var statusCondition = doc.processedStatus && validProcessedStatuses.includes(doc.processedStatus);\n    var amendmentCondition = doc.amendmentDisplayStatus && validAmendmentStatuses.includes(doc.amendmentDisplayStatus);\n\n    return statusCondition || amendmentCondition;\n}\n\n// 2️ Check recall eligibility (includes parent treatments)\nfunction isRecallEligible(doc) {\n    var eligibleServices = [\"Hemodialysis\", \"Apheresis\", \"Non-Treatment Service(s)\"];\n    var optionA = doc.serviceType && eligibleServices.includes(doc.serviceType) && doc.patientRecallAdditionalInfo && doc.patientRecallAdditionalInfo!==null;\n    var optionB = doc.parent; // PD/CRRT parent treatments\n    return optionA || optionB;\n}\n\n// 3️ Fetch parent document\nfunction fetchParentDoc(parentId) {\n    try {\n        var res = couchbase.get(src_col, { id: parentId });\n        if(res && res.doc){\n            log(\"Fetched parent doc \"+parentId);\n            return res.doc;\n        }\n        log(\"Parent doc not found for id: \"+parentId);\n        return null;\n    } catch (err) {\n        log(\"Error fetching parent document with id: \" + parentId + \": \" + JSON.stringify(err));\n        return null;\n    }\n}\n\n// 4️ Find matching treatment report\nfunction findMatchingReport(doc) {\n    var encounterId = doc.encounterId || null;\n    if (!encounterId) return null;\n\n    var isAmendment = doc.amendmentDisplayStatus === \"amendment-submitted\";\n\n    var query = `\n        SELECT META(r).id AS reportId, r.*\n        FROM \\`Path_Grande_Dev3\\`.\\`_default\\`.\\`Reports\\` r\n        WHERE r.encounterId = $1\n          AND r.reportType = \"DaVita Treatment Summary Report\"\n          AND TRIM(r.displayStatus) IN [\"submitted\", \"Posted To Kafka\"]\n          AND r.attachment IS NOT NULL\n    `;\n    query += isAmendment ? \" AND r.isAmended = true\" : \" AND (r.isAmended = false OR r.isAmended IS MISSING)\";\n\n    try {\n        var rows = N1QL(query, [encounterId]);\n        for (var r of rows) return r; // taking first match\n    } catch (err) {\n        log(\"Error running report query: \" + JSON.stringify(err));\n        return null;\n    }\n    return null;\n}\n\n// 5 Fetch or create PatientRecallInfo (identity-based)\nfunction fetchOrCreateRecall(parentDoc) {\n    var patRecallDoc = null;\n    var patientRecallInfoId = null;\n\n    // Search PatientRecallInfo by patient identity\n    try {\n        var patientrecallFilter = `\n            SELECT META(r).id AS patientRecallInfoId, r.*\n            FROM \\`Path_Grande_Dev3\\`.\\`_default\\`.\\`PatientRecallInfo\\` r\n            WHERE r.hospitalId = $1\n              AND r.firstName = $2\n              AND r.lastName = $3\n              AND r.mrn = $4\n              AND r.patientRecallAdditionalInfo.birthDate = $5\n        `;\n        var rows = N1QL(patientrecallFilter, [\n            parentDoc.hospitalId,\n            parentDoc.firstName,\n            parentDoc.lastName,\n            parentDoc.mrn,\n            parentDoc.patientRecallAdditionalInfo?.birthDate || \"\"\n        ]);\n        var res=[];\n        for(var r of rows){\n            res.push(r);\n        }\n        \n        if (res.length > 0) {\n            patRecallDoc = res[0];\n            patientRecallInfoId = patRecallDoc.patientRecallInfoId;\n        }\n    } catch (err) {\n        log(\"Error fetching PatientRecallInfo: \" + JSON.stringify(err));\n    }\n\n    // If not found, create new recall ID\n    if (!patientRecallInfoId) patientRecallInfoId = \"recall::\" + generateUUID();\n\n    return { patientRecallInfoId, patRecallDoc };\n}\n\n// 6️ Build treatmentReportInfo entry (uses parent fields)\nfunction buildTreatmentReportEntry(parentDoc, reportDoc) {\n    return {\n        id: generateUUID(),\n        reportId: reportDoc.reportId,\n        submitted: reportDoc.submitted || new Date().toISOString(),\n        displayStatus: reportDoc.displayStatus || \"\",\n        submittedBy: reportDoc.submittedBy || \"\",\n        hospitalId: reportDoc.hospitalId,\n        serviceType: parentDoc.serviceType || \"\",\n        middleName: reportDoc.middleName || \"\",\n        encounterId: reportDoc.encounterId,\n        isAmended: !!reportDoc.isAmended\n    };\n}\n\n// 7️ Upsert PatientRecallInfo with report deduplication\nfunction upsertRecall(patientRecallInfoId, patRecallDoc, treatmentReportEntry, parentDoc) {\n    try {\n        /***************\n         * Build _modifiedBy structure:\n         **************/\n        var modifiedByBlock = parentDoc?._modifiedBy \n        ? parentDoc._modifiedBy \n        : {\n            updatedBy:{\n                name:\"\",\n                modifiedTS: new Date().toISOString()\n            },\n            updateHistory:[]\n\n        };\n        if (patRecallDoc) {\n            var existingReports = patRecallDoc.treatmentReportInfo || [];\n            var exists = existingReports.some(r => r.reportId === treatmentReportEntry.reportId);\n\n            if (!exists) {\n                couchbase.mutateIn(recall_col, { id: patientRecallInfoId }, [\n                    couchbase.MutateInSpec.arrayAppend(\"treatmentReportInfo\", treatmentReportEntry),\n                    couchbase.MutateInSpec.upsert(\"lastUpdated\", new Date().toISOString()),\n                    couchbase.MutateInSpec.upsert(\"serviceType\", parentDoc.serviceType || \"\"),\n                    couchbase.MutateInSpec.upsert(\"_modifiedBy\", modifiedByBlock)\n\n                ]);\n                log(\"Updated PatientRecallInfo \" + patientRecallInfoId + \" with new report.\");\n            } else {\n                log(\"Report already linked in recall \" + patientRecallInfoId);\n            }\n        } else {\n            var newRecallDoc = {\n                //id:\n                patientRecallInfoId: patientRecallInfoId,\n                appType: parentDoc.appType ||\"\",\n                hospitalId: parentDoc.hospitalId,\n                firstName: parentDoc.firstName,\n                middleName: parentDoc.middleName || \"\",\n                lastName: parentDoc.lastName,\n                mrn: parentDoc.mrn,\n                patientRecallAdditionalInfo: parentDoc.patientRecallAdditionalInfo || {},\n                treatmentReportInfo: [treatmentReportEntry],\n                lastUpdated: new Date().toISOString(),\n                serviceType: parentDoc.serviceType || \"\",\n                _modifiedBy: modifiedByBlock\n\n            };\n            couchbase.upsert(recall_col, { id: patientRecallInfoId }, newRecallDoc);\n            log(\"Created new PatientRecallInfo=\" + patientRecallInfoId);\n        }\n    } catch (err) {\n        log(\"Error writing PatientRecallInfo=\" + patientRecallInfoId + \": \" + JSON.stringify(err));\n    }\n}\n\n// 8️ Link PatientTreatment to PatientRecallInfo\nfunction linkTreatmentToRecall(metaId, record, patientRecallInfoId) {\n    try {\n        if (!record.patientRecallInfoId) {\n            log(\"Inside Parent record to update the patientRecallInfoId\");\n            log(\"Parent record:::::\")\n            log(JSON.stringify(record));\n            log(\"===================================================\");\n            couchbase.mutateIn(src_col, { id: metaId }, [\n                couchbase.MutateInSpec.upsert(\"patientRecallInfoId\", patientRecallInfoId)\n            ]);\n            log(\"Linked PatientTreatment \" + metaId + \" -> PatientRecallInfo \" + patientRecallInfoId);\n        } else {\n            log(\"PatientTreatment \" + metaId + \" already linked to \" + record.patientRecallInfoId);\n        }\n    } catch (err) {\n        log(\"Error linking PatientTreatment \" + metaId + \": \" + JSON.stringify(err));\n    }\n}\n\n// 9️ UUID Generator\nfunction generateUUID() {\n    var d = new Date().getTime();\n    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {\n        var r = (d + Math.random() * 16) % 16 | 0;\n        d = Math.floor(d / 16);\n        return (c === 'x' ? r : ((r & 0x3) | 0x8)).toString(16);\n    });\n}\n",
+        "depcfg": {
+            "buckets": [
+                {
+                    "alias": "recall_col",
+                    "bucket_name": "Path_Grande_Dev3",
+                    "scope_name": "_default",
+                    "collection_name": "PatientRecallInfo",
+                    "access": "rw"
+                },
+                {
+                    "alias": "src_col",
+                    "bucket_name": "Path_Grande_Dev3",
+                    "scope_name": "_default",
+                    "collection_name": "PatientTreatment",
+                    "access": "rw"
+                }
+            ],
+            "source_bucket": "Path_Grande_Dev3",
+            "source_scope": "_default",
+            "source_collection": "PatientTreatment",
+            "metadata_bucket": "Path_Grande_Dev3",
+            "metadata_scope": "_default",
+            "metadata_collection": "PatientRecallFullStorage"
+        },
+        "version": "evt-7.6.6-6126-ee",
+        "enforce_schema": false,
+        "handleruuid": 4076352834,
+        "function_instance_id": "bBh&&",
+        "appname": "PatientRecallFull",
+        "settings": {
+            "allow_sync_documents": true,
+            "cursorAware": false,
+            "cursor_aware": false,
+            "dcp_stream_boundary": "from_now",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    },
+    {
+        "appcode": "function hasRequiredTxData(patientTxRec, encounterRecord) {\n    try {\n        log(`Inside hasRequiredTxData function`)\n        // Added in-amendment in statusList to moved status to received\n        const statusList = [\"in-amendment\", \"amendment-submitted\", \"amendment-cancelled\", \"amendment-received\", \"received\", \"submitted\", \"cancelled\", \"cancelled-no-billing\", \"entered-in-error\"];\n\n        if (encounterRecord && statusList.includes(encounterRecord.txStatusTracker.current.value)) {\n            if (patientTxRec.serviceType === \"Hemodialysis\" && encounterRecord.txStatusTracker.current.value === \"submitted\") {\n                const acoiResult = couchbase.get(acoiCollection, { id: encounterRecord.acoiData.foreignId });\n                if (!acoiResult.doc) {\n                    log(\"ACOI record not found for id \" + encounterRecord.acoiData.foreignId);\n                    return false;\n                }\n            }\n            return true;\n        }\n        log(\"Encounter record with id \" + patientTxRec.encounterId + (encounterRecord ? \" status is \" + encounterRecord.txStatusTracker.current.value : \" not found\"));\n        return false;\n    } catch (error) {\n        log(`Error in hasRequiredTxData ${error.message} for ptxId: ${patientTxRec.id}`);\n        return false;\n    }\n}\n\nfunction generateUUID() {\n    var d = new Date().getTime();\n    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n        var r = (d + Math.random() * 16) % 16 | 0;\n        d = Math.floor(d / 16);\n        return (c === 'x' ? r : ((r & 0x3) | 0x8)).toString(16);\n    });\n}\n\nfunction checkAndInsertComplianceAlert(patientTxRec, serviceTypeIds) {\n    try {\n        log(`Inside checkAndInsertComplianceAlert function`)\n        const hospitalId = patientTxRec.hospitalId;\n        let encounterId = patientTxRec.encounterId;\n        let parentTx = null;\n        if ((patientTxRec.hasOwnProperty(\"parent\"))) {\n            const patientTxParentRec = couchbase.get(patientTreatmentCollection, { \"id\": patientTxRec.parent.id })\n            parentTx = { ...patientTxParentRec.doc }\n        }\n\n        // Checking wheather patientTxRec is txInit child of PD/CRRT or not\n        const isTxInitRecord = parentTx && ((parentTx.serviceTypeId === serviceTypeIds.PDParent && patientTxRec.serviceTypeId === serviceTypeIds.PDTxInitSupport) || (parentTx.serviceTypeId === serviceTypeIds.CRRTParent && patientTxRec.serviceTypeId === serviceTypeIds.CRRTTxInitRounding));\n        if (isTxInitRecord) {\n            encounterId = parentTx.encounterId;\n            // Skip if patientTxRec is PD/CRRT parent \n        } else if (!parentTx && [serviceTypeIds.PDParent, serviceTypeIds.CRRTParent].includes(patientTxRec.serviceTypeId)) {\n            return null;\n        }\n\n        let encounterRecord = couchbase.get(encounterCollection, { id: encounterId });\n        encounterRecord = { ...encounterRecord.doc }\n\n        // If patientTxRec is [TxEnd Child] or [HD,APH] then it has txEndDate else txDepartureDate\n        const isTxEndRecord = parentTx && (parentTx.serviceTypeId === serviceTypeIds.PDParent && patientTxRec.serviceTypeId === serviceTypeIds.PDTxEnd || parentTx.serviceTypeId === serviceTypeIds.CRRTParent && patientTxRec.serviceTypeId === serviceTypeIds.CRRTTxEnd);\n        const isTxEndDatePatRecord = isTxEndRecord || (!parentTx && [serviceTypeIds.HD, serviceTypeIds.APH].includes(patientTxRec.serviceTypeId));\n        const comparisionDateTimeObject = (isTxEndDatePatRecord) ? encounterRecord?.end : encounterRecord?.departure;\n        const comparisionDate = comparisionDateTimeObject?.date;\n        const comparisionTime = \"00:00\"; // Considering only date as db contains local timezone date and time\n        if (comparisionDate) {\n            const comparisionDateTime = new Date(`${comparisionDate}T${comparisionTime}Z`);\n            let hospitalSupplementCount;\n            const hospitalSuplCollectionFQN = `\\`Path_Master_Dev3\\`.\\`masterdata\\`.\\`HospitalSupplement\\``;\n            const fetchHospitalSulplementQuery = `SELECT COUNT(*) AS cnt FROM ${hospitalSuplCollectionFQN} WHERE hospitalId =$hospitalId AND contractEndDate < $comparisionDateTime`\n            const queryParameters = { '$hospitalId': hospitalId, '$comparisionDateTime': comparisionDateTime }\n            const fetchHospitalSulplementResult = N1QL(fetchHospitalSulplementQuery, queryParameters, { isPrepared: true });\n            for (var item of fetchHospitalSulplementResult) {   // Stream results using 'for' iterator.\n                hospitalSupplementCount = item.cnt;\n            }\n            fetchHospitalSulplementResult.close(); // End the query and free resources held\n\n            if (hospitalSupplementCount > 0) {\n                log(`ComplianceAlert: HospitalSupplement record found for hospitalId:${hospitalId}`);\n\n                var emailNotifyCollectionFQN = `\\`Path_Master_Dev3\\`.\\`masterdata\\`.\\`EmailNotification\\``;\n                var fetchEmailNotifytQuery = `SELECT COUNT(*) AS cnt FROM ${emailNotifyCollectionFQN} WHERE hospitalId =$hospitalId AND isArchived =$isArchived`\n                var emailNotifyParameters = { '$hospitalId': hospitalId, '$isArchived': false }\n                var fetchEmailNotifytResult = N1QL(fetchEmailNotifytQuery, emailNotifyParameters, { isPrepared: true });\n                var emailNotificationCount;\n                for (var item of fetchEmailNotifytResult) {   // Stream results using 'for' iterator.\n                    emailNotificationCount = item.cnt;\n                }\n                fetchEmailNotifytResult.close(); // End the query and free resources held\n\n                if (emailNotificationCount === 0) {\n                    /* Here instead of insertOne we are using updateOne because there may be chance that more than one insertOne functions execute parllelly when receiptStatusChange function is called multiple times by the trigger */\n                    const docId = generateUUID();\n                    const document = { hospitalId, complianceAlertDate: null, patientTreatmentID: patientTxRec.id, isArchived: false }\n                    const upsertQuery = `\n                    MERGE INTO ${emailNotifyCollectionFQN} AS target\n                    USING [$document] AS source\n                    ON target.hospitalId = source.hospitalId AND target.isArchived = source.isArchived\n                    WHEN MATCHED THEN\n                        UPDATE SET \n                        target.complianceAlertDate = source.complianceAlertDate,\n                        target.patientTreatmentID = source.patientTreatmentID\n                    WHEN NOT MATCHED THEN\n                        INSERT (KEY \"${docId}\", VALUE source);\n                `;\n                    const upsertQueryParameters = { '$document': document }\n                    const upsertQueryResults = N1QL(upsertQuery, upsertQueryParameters, { isPrepared: true });\n                    upsertQueryResults.close();\n                    log(`ComplianceAlert: EmailNotification record upserted successfully `);\n                } else {\n                    log(`ComplianceAlert: Record is already present in EmailNotification collection for hospitalId : ${hospitalId} with isArchived false :: ptxId: ${patientTxRec.id}`);\n                }\n            } else {\n                log(`ComplianceAlert: HospitalSupplement record not found for queryParameters ${JSON.stringify(queryParameters)} for ptxId: ${patientTxRec.id}`);\n            }\n        } else {\n            log(`ComplianceAlert: Not documented ${(isTxEndDatePatRecord) ? `treatmentEndDate: ${comparisionDate}, treatmentEndTime: ${comparisionTime}` : `treatmentDepartureDate: ${comparisionDate}, treatmentDepartureTime: ${comparisionTime}`} for ptxId: ${patientTxRec.id}`);\n        }\n    } catch (error) {\n        log(`Error in checkAndInsertComplianceAlert ${error.message} for ptxId: ${patientTxRec.id}`);\n    }\n}\n\nfunction updatePatientTxAndEncounterRecord(encounterRecord, newCurrentStatus, patientTxId, updateProperties) {\n    try {\n        // Update PatientTreatment Record\n        const mutations = Object.entries(updateProperties).map(([key, value]) => couchbase.MutateInSpec.upsert(key, value))\n        couchbase.mutateIn(patientTreatmentCollection, { \"id\": patientTxId }, mutations);\n\n        // Update Encounter Record\n        const encounterCollectionFQN = `\\`Path_Lite_Dev3\\`.\\`_default\\`.\\`Encounter\\``;\n        let encounteUpdateQuery = `Update ${encounterCollectionFQN} AS target \n                    SET target.\\`txStatusTracker\\`.\\`history\\`=ARRAY_APPEND(IFMISSINGORNULL(target.\\`txStatusTracker\\`.\\`history\\`, []), target.\\`txStatusTracker\\`.\\`current\\`),\n                     target.\\`txStatusTracker\\`.\\`current\\` = $newCurrentStatus\n                    WHERE target.\\`id\\` = $encounterId AND target.\\`txStatusTracker\\`.\\`current\\`.\\`value\\` != $status`\n        let queryParameters = { '$newCurrentStatus': newCurrentStatus, '$encounterId': encounterRecord.id, '$status': \"received\" }\n        let results = N1QL(encounteUpdateQuery, queryParameters, { isPrepared: true });\n        results.close();\n\n        log(`Updated patientTx with id:${patientTxId} and encounter txStatusTracker for id:${encounterRecord.id}`)\n    } catch (error) {\n        log(`Error in updatePatientTxAndEncounterRecord ${error.message} for ptxId: ${patientTxRec.id}`);\n        throw \"updatePatientTxAndEncounterRecord failed\" + error\n    }\n\n}\n\nfunction setExpiryDate(expiryHours) {\n    const date = new Date();\n    date.setHours(date.getHours() + expiryHours);\n    return date.toISOString()\n}\n\nfunction toProcessParentRecord(patientTxParentRec, statusList) {\n    try {\n        log(\"Inside toProcessParentRecord function\")\n        let encounterRecord = couchbase.get(encounterCollection, { id: patientTxParentRec.encounterId });\n        encounterRecord = { ...encounterRecord.doc }\n\n        let parentRecord = couchbase.get(patientTreatmentCollection, { \"id\": patientTxParentRec.id })\n        parentRecord = { ...parentRecord.doc }\n\n        let childTxNotReceivedCount;\n        const defaultTreatmentExpiry = new Date(\"4001-01-01\")\n        const patientTxCollectionFQN = `\\`Path_Lite_Dev3\\`.\\`_default\\`.\\`PatientTreatment\\``;\n        const fetchChildTxQuery = `SELECT COUNT(*) AS cnt FROM ${patientTxCollectionFQN} WHERE parent.id =$parentTxId AND treatmentExpiry =$treatmentExpiry`\n        const queryParameters = { '$parentTxId': parentRecord.id, '$treatmentExpiry': defaultTreatmentExpiry }\n        const fetchChildTxQueryResult = N1QL(fetchChildTxQuery, queryParameters, { isPrepared: true });\n        for (let item of fetchChildTxQueryResult) {   // Stream results using 'for' iterator.\n            childTxNotReceivedCount = item.cnt;\n        }\n        fetchChildTxQueryResult.close(); // End the query and free resources held\n        log(\"toProcessParentRecord childTxNotReceivedCount:\"+ childTxNotReceivedCount)\n        const newCurrentStatus = {\n            value: \"received\",\n            dateTime: new Date().toISOString(),\n        };\n\n        let hasParentValidReceipts = false;\n        let updateParentProperties;\n\n        // All child reocrds status is received then update the parent record to received status\n        if (childTxNotReceivedCount === 0) {\n            if (parentRecord.displayStatus === statusList.submittedStatus || parentRecord.displayStatus === statusList.cancelledStatus) {\n                log(`Found validReceipts for id: ${parentRecord.id} with displayStatus: ${parentRecord.displayStatus}`);\n                hasParentValidReceipts = true;\n                updateParentProperties = { displayStatus: \"received\", treatmentExpiry: setExpiryDate(72) };\n            }\n            if (parentRecord.displayStatus === statusList.noBillingStatus || parentRecord.displayStatus === statusList.enteredInErrorStatus) {\n                log(`Found validReceipts for id: ${parentRecord.id} with displayStatus: ${parentRecord.displayStatus}`);\n                hasParentValidReceipts = true;\n                updateParentProperties = { treatmentExpiry: setExpiryDate(72) };\n            }\n            if (hasParentValidReceipts && updateParentProperties && Object.keys(updateParentProperties).length > 0) {\n                log(`Updating PatientTreatment record with id:${parentRecord.id} and Encounter record with id:${encounterRecord.id}`);\n                updatePatientTxAndEncounterRecord(encounterRecord, newCurrentStatus, parentRecord.id, updateParentProperties)\n            }\n        }\n    } catch (error) {\n        log(`Error in toProcessParentRecord ${error.message}`);\n        throw `${error.message}`\n    }\n\n}\n\nfunction OnUpdate(doc, meta, xattrs) {\n    if (doc == null) return; // skip deletes\n\n    const statusList = {\n        submittedStatus: \"submitted\",\n        noBillingStatus: \"cancelled-no-billing\",\n        cancelledStatus: \"cancelled\",\n        enteredInErrorStatus: \"entered-in-error\",\n        amendmentSubmittedStatus: \"amendment-submitted\",\n        amendmentCancelledStatus: \"amendment-cancelled\"\n    };\n    // Validate appType\n    if (!doc.appType || doc.appType !== \"PATH-LITE\") {\n        log(\"Skipping ptxId\" + doc.id + \"due to appType mismatch: \" + doc.appType);\n        return;\n    }\n\n    // Validate trigger condition\n    if (!((doc.displayStatus && Object.values(statusList).includes(doc.displayStatus)) || (doc.amendmentDisplayStatus && Object.values(statusList).includes(doc.amendmentDisplayStatus)))) {\n        log(\"ptxId \" + doc.id + \" does not meet displayStatus/amendmentDisplayStatus conditions.\");\n        return;\n    }\n\n    const serviceTypeIds = {\n        HD: \"HWOW1\",\n        APH: \"HWOW3\",\n        NonTx: \"HWOW21\",\n        PDParent: \"HWOW2\", PDTxInitSupport: \"HWOW11\", PDSupport: \"HWOW2\", PDSupportTxEnd: \"HWOW3\", PDTxEnd: \"HWOW4\",\n        CRRTParent: \"HWOW4\", CRRTTxInitRounding: \"HWOW1\", CRRTRounding: \"HWOW2\", CRRTRoundingTxEnd: \"HWOW3\", CRRTTxEnd: \"HWOW11\",\n    };\n    const patientTxRec = doc;\n    const newCurrentStatus = {\n        value: \"received\",\n        dateTime: new Date().toISOString(),\n    };\n    const submittedReceiptsCondition = patientTxRec.ecmBillingAck && patientTxRec.ecmBillingAck != null && patientTxRec.cartBillingAck && patientTxRec.cartBillingAck != null\n    const amendmentReceiptsCondition = patientTxRec.amendedEcmBillingAck && patientTxRec.amendedEcmBillingAck != null\n    let hasValidReceipts = false;\n    let updateProperties;\n\n    log(\"Processing the patientTreatmentRecord with id\" + doc.id);\n    try {\n        let encounterRecord = couchbase.get(encounterCollection, { id: patientTxRec.encounterId });\n        encounterRecord = { ...encounterRecord.doc }\n        if (hasRequiredTxData(patientTxRec, encounterRecord)) {\n            if (patientTxRec.displayStatus === statusList.submittedStatus) {\n                checkAndInsertComplianceAlert(patientTxRec, serviceTypeIds)\n            }\n            if (!patientTxRec.hasOwnProperty(\"parent\") && [serviceTypeIds.HD, serviceTypeIds.APH, serviceTypeIds.NonTx].includes(patientTxRec.serviceTypeId)) {\n                log(\"Processing: HD/APH/Non-Tx Modalities\");\n\n                // Cancelled-no-billing & EIE Receipts not applicable\n                if (patientTxRec.displayStatus === statusList.noBillingStatus || patientTxRec.displayStatus === statusList.enteredInErrorStatus) {\n                    log(`Found validReceipts for ptxId: ${patientTxRec.id} with displayStatus: ${patientTxRec.displayStatus}`);\n                    hasValidReceipts = true;\n                    updateProperties = { treatmentExpiry: setExpiryDate(72) };\n                }\n                // Submitted/ Cancelled case applicable ecmTreatment, ecmBilling & billing receipts \n                if (patientTxRec.displayStatus === statusList.cancelledStatus || patientTxRec.displayStatus === statusList.submittedStatus) {\n                    if (submittedReceiptsCondition) {\n                        log(`Found validReceipts for ptxId: ${patientTxRec.id} with displayStatus: ${patientTxRec.displayStatus}`);\n                        hasValidReceipts = true;\n                        updateProperties = { displayStatus: \"received\", treatmentExpiry: setExpiryDate(72) };\n                    }\n                }\n                //Amendment is only applicable to HD, APH and Non-Tx\n                if (patientTxRec.amendmentDisplayStatus === statusList.amendmentSubmittedStatus || patientTxRec.amendmentDisplayStatus === statusList.amendmentCancelledStatus) {\n                    if (amendmentReceiptsCondition) {\n                        log(`Found validReceipts for ptxId: ${patientTxRec.id} with amendmentDisplayStatus: ${patientTxRec.amendmentDisplayStatus}`)\n                        hasValidReceipts = true;\n                        newCurrentstatusList.value = \"amendment-received\";\n                        updateProperties = { amendmentDisplayStatus: \"amendment-received\", treatmentExpiry: setExpiryDate(72) };\n                    }\n                }\n\n                if (hasValidReceipts && updateProperties && Object.keys(updateProperties).length > 0) {\n                    log(`Updating PatientTreatment record with id:${patientTxRec.id} and Encounter record with id:${encounterRecord.id}`);\n                    updatePatientTxAndEncounterRecord(encounterRecord, newCurrentStatus, patientTxRec.id, updateProperties)\n                }\n            }\n            else if (!patientTxRec.hasOwnProperty(\"parent\") && (patientTxRec.serviceTypeId === serviceTypeIds.CRRTParent || patientTxRec.serviceTypeId === serviceTypeIds.PDParent)) {\n                log(\"Processing: CRRT Parent/PD Parent\");\n                toProcessParentRecord(patientTxRec, statusList);\n            }\n            else if (patientTxRec.hasOwnProperty(\"parent\")) {\n                log(\"Processing: CRRT/PD Child\");\n                let patientTxParentRec = couchbase.get(patientTreatmentCollection, { \"id\": patientTxRec.parent.id })\n                patientTxParentRec = { ...patientTxParentRec.doc }\n                //  Identify the PD/CRRT child records and process records\n                if (patientTxParentRec && (patientTxParentRec.serviceTypeId === serviceTypeIds.PDParent || patientTxParentRec.serviceTypeId === serviceTypeIds.CRRTParent)) {\n                    if (patientTxRec.parent) {\n                        if (patientTxRec.displayStatus === statusList.noBillingStatus || patientTxRec.displayStatus === statusList.enteredInErrorStatus) {\n                            log(`Found validReceipts for ptxId: ${patientTxRec.id} with displayStatus: ${patientTxRec.displayStatus}`);\n                            hasValidReceipts = true;\n                            updateProperties = { treatmentExpiry: setExpiryDate(72) };\n                        }\n\n                        if (patientTxRec.displayStatus === statusList.submittedStatus || patientTxRec.displayStatus === statusList.cancelledStatus) {\n                            // Processing CRRT/PD Childs here - like TxInitRounding/Support & Rounding/Support & TxEnd\n                            if (submittedReceiptsCondition) {\n                                log(`Found validReceipts for ptxId: ${patientTxRec.id} with displayStatus: ${patientTxRec.displayStatus}`);\n                                hasValidReceipts = true;\n                                updateProperties = { displayStatus: \"received\", treatmentExpiry: setExpiryDate(72) };\n                            }\n                        }\n\n                        if (hasValidReceipts && updateProperties && Object.keys(updateProperties).length > 0) {\n                            log(`Updating PatientTreatment record with id:${patientTxRec.id} and Encounter record with id:${encounterRecord.id}`);\n                            updatePatientTxAndEncounterRecord(encounterRecord, newCurrentStatus, patientTxRec.id, updateProperties)\n                        }\n                        // Process CRRT/PD Parent\n                        toProcessParentRecord(patientTxParentRec, statusList);\n                    } else {\n                        log(\"Parent record not found or serviceId didn't match for id \" + patientTxRec.parent.id);\n                    }\n                }\n            }\n        } else {\n            log(\"Data not yet synced for patient treatment \" + patientTxRec.id + \" and encounterId \" + patientTxRec.encounterId);\n        }\n    } catch (error) {\n        log(`Error in receiptStatusChange ${error.message} for ptxId: ${doc.id}`);\n    }\n}\n",
+        "depcfg": {
+            "buckets": [
+                {
+                    "alias": "hospitalSupplementCollection",
+                    "bucket_name": "Path_Master_Load",
+                    "scope_name": "masterdata",
+                    "collection_name": "HospitalSupplement",
+                    "access": "r"
+                },
+                {
+                    "alias": "encounterCollection",
+                    "bucket_name": "Path_Lite_Dev3",
+                    "scope_name": "_default",
+                    "collection_name": "Encounter",
+                    "access": "rw"
+                },
+                {
+                    "alias": "acoiCollection",
+                    "bucket_name": "Path_Lite_Dev3",
+                    "scope_name": "_default",
+                    "collection_name": "ACOI",
+                    "access": "r"
+                },
+                {
+                    "alias": "patientTreatmentCollection",
+                    "bucket_name": "Path_Lite_Dev3",
+                    "scope_name": "_default",
+                    "collection_name": "PatientTreatment",
+                    "access": "rw"
+                }
+            ],
+            "source_bucket": "Path_Lite_Dev3",
+            "source_scope": "_default",
+            "source_collection": "PatientTreatment",
+            "metadata_bucket": "Path_Lite_Dev3",
+            "metadata_scope": "_default",
+            "metadata_collection": "ReceiptStatusChangeEvntStorage"
+        },
+        "version": "evt-7.6.6-6126-ee",
+        "enforce_schema": false,
+        "handleruuid": 3162642090,
+        "function_instance_id": "XddP03",
+        "appname": "ReceiptStatusChangeLite",
+        "settings": {
+            "allow_sync_documents": true,
+            "cursorAware": false,
+            "cursor_aware": false,
+            "dcp_stream_boundary": "from_now",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "Monitors peatient treatment documents  mutations",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    },
+    {
+        "appcode": "/**\n * Eventing Function: patientRecallFull\n *\n * Purpose:\n *   - Listens to PatientTreatment inserts/updates.\n *   - Ensures patient has a PatientRecallInfo record.(If doesn't exist creat new one):\n *   - Adds new treatment reports to PatientRecallInfo.\n *   - Handles HD, APH, Non-Tx and parent treatments like CRRT/PD and it's associated child treatements\n *\n * Bindings Required:\n *   - src_col     (Read/Write) → PatientTreatment\n *   - recall_col  (Read/Write) → PatientRecallInfo\n */\n\n// * Main Eventing Handler\n\nfunction OnUpdate(doc, meta, xattrs) {\n    if (!doc) return; // skip deletes\n\n    log(\"Triggered for PatientTreatment id=\" + meta.id);\n\n    //   Validate status\n    if (!isValidStatus(doc)) {\n        log(\"Doc \" + meta.id + \" skipped: invalid processedStatus/amendmentDisplayStatus.\");\n        return;\n    }\n\n    // 2️ Check recall eligibility\n    if (!isRecallEligible(doc)) {\n        log(\"Doc \" + meta.id + \" skipped: not eligible for recall.\");\n        return;\n    }\n\n    // 3️ Fetch the parent document if exists (PD, CRRT)\n    let parentDoc = doc; // using self doc as fallback if parentDoc doesn't exist\n    if(doc.parent && doc.parent.id){\n        parentDoc = fetchParentDoc(doc.parent.id);\n        if(!parentDoc){\n            log(`parent record not found for child ${meta.id} with parentId =${doc.parent.id}, using self as fallback`);\n        }\n\n    }\n    /*commenting reports related code as this will be used in future-epics*/\n    // 4️ Fetch matching treatment report\n   \n\n    // 5️ Find or create PatientRecallInfo using patient identity\n    var recallData = fetchOrCreateRecall(parentDoc);\n    var patientRecallInfoId = recallData.patientRecallInfoId;\n    var patRecallDoc = recallData.patRecallDoc;\n\n    // 6️ Build treatmentReportInfo entry (empty in case of Lite)\n    var treatmentReportEntry = [];\n\n    // 7️ Upsert PatientRecallInfo (deduplicate reports)\n    upsertRecall(patientRecallInfoId, patRecallDoc, treatmentReportEntry, parentDoc);\n\n    // 8️ Link PatientTreatment --> PatientRecallInfo\n    linkTreatmentToRecall(meta.id, doc, patientRecallInfoId);\n\n    //9 If doc has a parent , also link parent treatment to same patientRecallInfoId:\n    if(doc.parent && doc.parent.id ){\n        log(`child ${meta.id} +\" has a parent -> linking parent ${doc.parent.id} to recall ${patientRecallInfoId}`);\n        // linkTreatmentToRecall(doc.parent.id, {patientRecallInfoId: null}, patientRecallInfoId);\n        try{\n            var parentRecord = fetchParentDoc(doc.parent.id);\n            linkTreatmentToRecall(doc.parent.id, parentRecord, patientRecallInfoId);\n        }catch(err){\n             log(\"While updating the PatientRecallInfoId in the parent Doc, Error fetching parent document with id: \" + parentId + \": \" + JSON.stringify(err));\n        }\n        \n    }\n}\n\n// * Helper Functions\n\n//   Validate processed/amendment status\nfunction isValidStatus(doc) {\n    var validProcessedStatuses = [\"submitted\"];\n    var validAmendmentStatuses = [\"amendment-submitted\"];\n\n    var statusCondition = doc.processedStatus && validProcessedStatuses.includes(doc.processedStatus);\n    var amendmentCondition = doc.amendmentDisplayStatus && validAmendmentStatuses.includes(doc.amendmentDisplayStatus);\n\n    return statusCondition || amendmentCondition;\n}\n\n// 2️ Check recall eligibility (includes parent treatments)\nfunction isRecallEligible(doc) {\n    var eligibleServices = [\"Hemodialysis\", \"Apheresis\", \"Non-Treatment Service(s)\"];\n    var optionA = doc.serviceType && eligibleServices.includes(doc.serviceType) && doc.patientRecallAdditionalInfo && doc.patientRecallAdditionalInfo!==null;\n    var optionB = doc.parent; // PD/CRRT parent treatments\n    log(\"OptionB value is: \"+optionB);\n    return optionA || optionB;\n}\n\n// 3️ Fetch parent document\nfunction fetchParentDoc(parentId) {\n    try {\n        var res = couchbase.get(src_col, { id: parentId });\n        if(res && res.doc){\n            log(\"Fetched parent doc \"+parentId);\n            return res.doc;\n        }\n        log(\"Parent doc not found for id: \"+parentId);\n        return null;\n    } catch (err) {\n        log(\"Error fetching parent document with id: \" + parentId + \": \" + JSON.stringify(err));\n        return null;\n    }\n}\n/*commenting reports related code as this will be used in future-epics*/\n// 4️ Find matching treatment report\n// 5 Fetch or create PatientRecallInfo (identity-based)\nfunction fetchOrCreateRecall(parentDoc) {\n    var patRecallDoc = null;\n    var patientRecallInfoId = null;\n\n    // Search PatientRecallInfo by patient identity\n    try {\n        var patientrecallFilter = `\n            SELECT META(r).id AS patientRecallInfoId, r.*\n            FROM \\`Path_Lite_Dev3\\`.\\`_default\\`.\\`PatientRecallInfo\\` r\n            WHERE r.hospitalId = $1\n              AND r.firstName = $2\n              AND r.lastName = $3\n              AND r.mrn = $4\n              AND r.patientRecallAdditionalInfo.birthDate = $5\n        `;\n        var rows = N1QL(patientrecallFilter, [\n            parentDoc.hospitalId,\n            parentDoc.firstName,\n            parentDoc.lastName,\n            parentDoc.mrn,\n            parentDoc.patientRecallAdditionalInfo?.birthDate || \"\"\n        ]);\n        var res=[];\n        for(var r of rows){\n            res.push(r);\n        }  \n        if (res.length > 0) {\n            patRecallDoc = res[0];\n            patientRecallInfoId = patRecallDoc.patientRecallInfoId;\n        }\n    } catch (err) {\n        log(\"Error fetching PatientRecallInfo: \" + JSON.stringify(err));\n    }\n\n    // If not found, create new recall ID\n    if (!patientRecallInfoId) patientRecallInfoId = \"recall::\" + generateUUID();\n\n    return { patientRecallInfoId, patRecallDoc };\n}\n\n/*** 6️ Build treatmentReportInfo entry (Empty in case of Lite)  */\n\n// 7️ Upsert PatientRecallInfo with report deduplication\nfunction upsertRecall(patientRecallInfoId, patRecallDoc, treatmentReportEntry, parentDoc) {\n    try {\n        /***************\n         * Build _modifiedBy structure:\n         **************/\n        var modifiedByBlock = parentDoc?._modifiedBy \n        ? parentDoc._modifiedBy \n        : {\n            updatedBy:{\n                name:\"\",\n                modifiedTS: new Date().toISOString()\n            },\n            updateHistory:[]\n\n        };\n        if (patRecallDoc) {\n            /*commenting reports related code as this will be used in future-epics*/\n            //var existingReports = patRecallDoc.treatmentReportInfo || [];\n            //var exists = existingReports.some(r => r.reportId === treatmentReportEntry.reportId);\n\n            couchbase.mutateIn(recall_col, { id: patientRecallInfoId }, [\n               // couchbase.MutateInSpec.arrayAppend(\"treatmentReportInfo\", treatmentReportEntry),\n                couchbase.MutateInSpec.upsert(\"patientRecallAdditionalInfo\", parentDoc.patientRecallAdditionalInfo || null),\n                couchbase.MutateInSpec.upsert(\"lastUpdated\", new Date().toISOString()),\n                couchbase.MutateInSpec.upsert(\"serviceType\", parentDoc.serviceType || \"\"),\n                couchbase.MutateInSpec.upsert(\"_modifiedBy\", modifiedByBlock)\n\n            ]);\n            log(\"Updated PatientRecallInfo \" + patientRecallInfoId + \" with new report.\");\n        } else {\n            var newRecallDoc = {\n                //id:\n                patientRecallInfoId: patientRecallInfoId,\n                appType: parentDoc.appType ||\"\",\n                hospitalId: parentDoc.hospitalId,\n                firstName: parentDoc.firstName,\n                middleName: parentDoc.middleName || \"\",\n                lastName: parentDoc.lastName,\n                mrn: parentDoc.mrn,\n                patientRecallAdditionalInfo: parentDoc.patientRecallAdditionalInfo || {},\n                treatmentReportInfo: [treatmentReportEntry],\n                lastUpdated: new Date().toISOString(),\n                serviceType: parentDoc.serviceType || \"\",\n                _modifiedBy: modifiedByBlock\n\n            };\n            couchbase.upsert(recall_col, { id: patientRecallInfoId }, newRecallDoc);\n            log(\"Created new PatientRecallInfo=\" + patientRecallInfoId);\n        }\n    } catch (err) {\n        log(\"Error writing PatientRecallInfo=\" + patientRecallInfoId + \": \" + JSON.stringify(err));\n    }\n}\n\n// 8️ Link PatientTreatment to PatientRecallInfo\nfunction linkTreatmentToRecall(metaId, record, patientRecallInfoId) {\n    try {\n        if (!record.patientRecallInfoId) {\n            couchbase.mutateIn(src_col, { id: metaId }, [\n                couchbase.MutateInSpec.upsert(\"patientRecallInfoId\", patientRecallInfoId)\n            ]);\n            log(\"Linked PatientTreatment \" + metaId + \" -> PatientRecallInfo \" + patientRecallInfoId);\n        } else {\n            log(\"PatientTreatment \" + metaId + \" already linked to \" + record.patientRecallInfoId);\n        }\n    } catch (err) {\n        log(\"Error linking PatientTreatment \" + metaId + \": \" + JSON.stringify(err));\n    }\n}\n\n// 9️ UUID Generator\nfunction generateUUID() {\n    var d = new Date().getTime();\n    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {\n        var r = (d + Math.random() * 16) % 16 | 0;\n        d = Math.floor(d / 16);\n        return (c === 'x' ? r : ((r & 0x3) | 0x8)).toString(16);\n    });\n}\n",
+        "depcfg": {
+            "buckets": [
+                {
+                    "alias": "recall_col",
+                    "bucket_name": "Path_Lite_Dev3",
+                    "scope_name": "_default",
+                    "collection_name": "PatientRecallInfo",
+                    "access": "rw"
+                },
+                {
+                    "alias": "src_col",
+                    "bucket_name": "Path_Lite_Dev3",
+                    "scope_name": "_default",
+                    "collection_name": "TstPtx",
+                    "access": "rw"
+                }
+            ],
+            "source_bucket": "Path_Lite_Dev3",
+            "source_scope": "_default",
+            "source_collection": "TstPtx",
+            "metadata_bucket": "Path_Lite_Dev3",
+            "metadata_scope": "_default",
+            "metadata_collection": "patientRecallEnvStorage"
+        },
+        "version": "evt-7.6.6-6126-ee",
+        "enforce_schema": false,
+        "handleruuid": 2523106534,
+        "function_instance_id": "ZH9MO3",
+        "appname": "patientRecalEventing",
+        "settings": {
+            "allow_sync_documents": true,
+            "cursorAware": false,
+            "cursor_aware": false,
+            "dcp_stream_boundary": "from_now",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "Trigger to Maintain Patients information globally for Patient Recall",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    },
+    {
+        "appcode": "function OnUpdate(doc, meta, xattrs) {\n   log(\"PatientRecallInfo Control OnUpdate\", meta.id);\n\n   if (doc.enabled) {\n      log(\"Eventing enabled for PatientRecallInfo recurring job\", doc);\n      // Start recurring timer when enabled\n      createTimer(PatientRecallInfoTimerCallback, getNextRecurringDate(), meta.id, doc);\n   } else {\n      log(\"Eventing disabled for PatientRecallInfo recurring job\", doc);\n      // Stop recurring timer when disabled\n      cancelTimer(PatientRecallInfoTimerCallback, meta.id);\n   }\n}\n\nfunction PatientRecallInfoTimerCallback(context) {\n   log(\"From PatientRecallInfoTimerCallback: timer fired\", context);\n\n   // Schedule next run\n   createTimer(PatientRecallInfoTimerCallback, getNextRecurringDate(), context.id, context);\n\n   try {\n      // Delete records older than BufferTime days\n      var query = `\n         DELETE FROM ${PatientRecallInfo}\n         WHERE STR_TO_MILLIS(lastUpdated) < STR_TO_MILLIS(DATE_ADD_STR(NOW_STR(), ${BufferTime}, 'day'))\n         RETURNING meta().id, lastUpdated;\n      `;\n      log(\"Executing delete query:\", query);\n\n      var result = N1QL(query);\n      log('PatientRecallInfoTimerCallback query executed successfully', result);\n   } catch (e) {\n      log('Error while executing cleanup query:', e);\n   }\n}\n\n// Set next recurring job\n\nfunction getNextRecurringDate() {\n   var currentTimestamp = new Date();\n   var nextRun = new Date(\n      currentTimestamp.getFullYear(),\n      currentTimestamp.getMonth(),\n      currentTimestamp.getDate() + 1,\n      0, 0, 0\n   );\n   log('Next schedule time for PatientRecallInfo:', nextRun);\n   return nextRun;\n}\n\nfunction OnDelete(meta, options) {\n   log(\"PatientRecallInfo Control OnDelete\", meta.id);\n   cancelTimer(PatientRecallInfoTimerCallback, meta.id);\n}\n",
+        "depcfg": {
+            "constants": [
+                {
+                    "value": "PatientRecallInfo",
+                    "literal": "\"Path_Lite_Dev3.`treatment`.`PatientRecallInfo`\""
+                },
+                {
+                    "value": "BufferTime",
+                    "literal": "-60"
+                }
+            ],
+            "source_bucket": "Path_Lite_Dev3",
+            "source_scope": "_default",
+            "source_collection": "PatientRecallInfoControl",
+            "metadata_bucket": "Path_Lite_Dev3",
+            "metadata_scope": "_default",
+            "metadata_collection": "PatientRecallInfoMetaData"
+        },
+        "version": "evt-7.6.7-6706-ee",
+        "enforce_schema": false,
+        "handleruuid": 25445806,
+        "function_instance_id": "5DerA2",
+        "appname": "CleanPatienRecallInfo",
+        "settings": {
+            "allow_sync_documents": true,
+            "cursorAware": false,
+            "cursor_aware": false,
+            "dcp_stream_boundary": "everything",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "delete the expire data",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    },
+    {
+        "appcode": "function OnUpdate(doc, meta, xattrs) {\n   log(\"Received updated doc from Eventing:\", doc.id);\n   var query = N1QL(`EXECUTE FUNCTION Path_Master_Load.masterdata.TestTransactionUDF()`);\n   log(\"Execution completed******1111\", query);\n}\n    \nfunction OnDelete(meta, options) {\n   log(\"Doc deleted/expired\", meta.id);\n}",
+        "depcfg": {
+            "source_bucket": "Path_Master_Load",
+            "source_scope": "masterdata",
+            "source_collection": "CommonValue",
+            "metadata_bucket": "Path_Master_Load",
+            "metadata_scope": "_default",
+            "metadata_collection": "UDFTesting"
+        },
+        "version": "evt-7.6.7-6706-ee",
+        "enforce_schema": false,
+        "handleruuid": 1169114149,
+        "function_instance_id": "9M9ZC3",
+        "appname": "UDFTesting",
+        "settings": {
+            "allow_sync_documents": false,
+            "cursorAware": true,
+            "cursor_aware": true,
+            "dcp_stream_boundary": "from_now",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "UDFTesting",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    },
+    {
+        "appcode": "function OnUpdate(doc, meta) {\n    try {\n       \n        if (!doc.id || !doc.name) {\n            log(\"HospitalRoleCreator: skipping role creation without id/name:\", meta.id);\n            return;\n        }\n\n        log(\"Received hospital doc from Eventing:\", doc.id, doc.name);\n\n        var roleName = \"role_tx_PatientTreatment_\" + doc.id;\n\n        // Collections for Grande\n        var collectionsGrande = {\n            PatientTreatment: \"tx_PatientTreatment_\" + doc.id,\n            DeviceConfiguration: \"hc_DeviceConfiguration_\" +  doc.id,\n            HospitalConfiguration: \"hc_HospitalConfiguration_\" + doc.id,\n            PatientRecallState: \"tx_PatientRecallState_\" + doc.id,\n            Reports: \"tx_Reports_\" + doc.id,\n            CustomPhysician:\"tx_CustomPhysician\"\n        };\n\n        // Collections for Lite (subset)\n        var collectionsLite = {\n            PatientTreatment: \"tx_PatientTreatment_\" + doc.id,\n            PatientRecallState: \"tx_PatientRecallState_\" + doc.id,\n            Reports: \"tx_Reports_\" + doc.id,\n            CustomPhysician:\"tx_CustomPhysician\"\n        };\n\n        // Process Grande\n        processRoleForTarget(grandeSgwURL, \"Grande\", roleName, collectionsGrande, meta.id);\n\n        // Process Lite with awareness of skipped collections\n        processRoleForTarget(liteSgwURL, \"Lite\", roleName, collectionsLite, meta.id, collectionsGrande);\n\n    } catch (outerErr) {\n        log(\"HospitalRoleCreator: Unhandled error for doc:\", meta.id, outerErr);\n    }\n}\n\nfunction processRoleForTarget(binding, targetLabel, roleName, collections, docId, referenceCollections) {\n    try {\n        // Log skipped collections if referenceCollections provided\n        if (referenceCollections) {\n            for (var coll in referenceCollections) {\n                if (!(coll in collections)) {\n                    log(\"[\" + targetLabel + \"] Skipped collection\", coll, \"(not defined for \" + targetLabel + \" target)\");\n                }\n            }\n        }\n\n        // Build newPayload dynamically\n        var newPayload = { name: roleName, collection_access: { treatment: {} } };\n        for (var coll in collections) {\n            newPayload.collection_access.treatment[coll] = {\n                admin_channels: [ collections[coll] ]\n            };\n        }\n\n        // --- Step 1: Check if role already exists ---\n        var existingRole = null;\n        try {\n            var checkReq = { path: \"_role/\" + encodeURIComponent(roleName) };\n            var checkRoleRes = curl(\"GET\", binding, checkReq);\n\n            if (!checkRoleRes) {\n                log(\"[\" + targetLabel + \"] ERROR - no response from Sync Gateway on GET for role\", roleName, \"Doc:\", docId);\n            } else if (checkRoleRes.status === 200) {\n                try {\n                    existingRole = JSON.parse(checkRoleRes.body);\n                } catch (parseErr) {\n                    log(\"[\" + targetLabel + \"] ERROR parsing existing role JSON for\", roleName, \"Body:\", checkRoleRes.body, \"Error:\", parseErr);\n                }\n            } else if (checkRoleRes.status === 404) {\n                log(\"[\" + targetLabel + \"] Role\", roleName, \"does not exist. Will create new.\");\n            } else {\n                log(\"[\" + targetLabel + \"] Unexpected GET status\", checkRoleRes.status, \"for role\", roleName, \"Body:\", checkRoleRes.body);\n            }\n        } catch (errGet) {\n            log(\"[\" + targetLabel + \"] Exception during GET for role\", roleName, \"Doc:\", docId, \"Error:\", errGet);\n        }\n\n        // --- Step 1b: Compare channels if role exists ---\n        var changedCollections = [];\n        if (existingRole) {\n            var existingAccess = (((existingRole || {}).collection_access || {}).treatment) || {};\n\n            for (var coll in collections) {\n                var existingChannels = existingAccess[coll]?.admin_channels || [];\n                var newChannels = newPayload.collection_access.treatment[coll].admin_channels;\n\n                if (JSON.stringify(existingChannels) !== JSON.stringify(newChannels)) {\n                    changedCollections.push({\n                        collection: coll,\n                        oldChannels: existingChannels,\n                        newChannels: newChannels\n                    });\n                }\n            }\n\n            if (changedCollections.length === 0) {\n                log(\"[\" + targetLabel + \"] Role\", roleName, \"already exists with same channels. Skipping update.\");\n                return;\n            }\n\n            for (var i = 0; i < changedCollections.length; i++) {\n                var ch = changedCollections[i];\n                log(\"[\" + targetLabel + \"] Role\", roleName, \"- Collection\", ch.collection, \"channels changed.\",\n                    \"Old:\", JSON.stringify(ch.oldChannels), \"New:\", JSON.stringify(ch.newChannels));\n            }\n        }\n\n        // --- Step 2: Create or Update role ---\n        try {\n            var putReq = {\n                path: \"_role/\" + encodeURIComponent(roleName),\n                headers: { \"Content-Type\": \"application/json\" },\n                body: newPayload\n            };\n            var putRoleRes = curl(\"PUT\", binding, putReq);\n\n            if (!putRoleRes) {\n                log(\"[\" + targetLabel + \"] ERROR - no response from Sync Gateway on PUT for role\", roleName, \"Doc:\", docId);\n            } else if (putRoleRes.status >= 200 && putRoleRes.status < 300) {\n                log(\"[\" + targetLabel + \"] Role\", roleName, \"successfully created/updated.\",\n                    \"Status:\", putRoleRes.status, \"Body:\", putRoleRes.body);\n            } else {\n                log(\"[\" + targetLabel + \"] FAILED to create/update role\", roleName,\n                    \"Status:\", putRoleRes.status, \"Body:\", putRoleRes.body, \"Doc:\", docId);\n            }\n        } catch (errPut) {\n            log(\"[\" + targetLabel + \"] Exception during PUT for role\", roleName, \"Doc:\", docId, \"Error:\", errPut);\n        }\n\n    } catch (innerErr) {\n        log(\"[\" + targetLabel + \"] Unhandled error for role\", roleName, \"Doc:\", docId, \"Error:\", innerErr);\n    }\n}\n\nfunction OnDelete(meta, options) {\n    // Placeholder for delete handling if needed\n}\n\n",
+        "depcfg": {
+            "curl": [
+                {
+                    "hostname": "https://9ta5vaemznwy6qkj-admin.apps.cloud.couchbase.com/path-grande-dev3/",
+                    "value": "grandeSgwURL",
+                    "auth_type": "basic",
+                    "username": "",
+                    "password": "",
+                    "bearer_key": "",
+                    "allow_cookies": false,
+                    "validate_ssl_certificate": false
+                },
+                {
+                    "hostname": "https://9ta5vaemznwy6qkj-admin.apps.cloud.couchbase.com/path-lite-dev3/",
+                    "value": "liteSgwURL",
+                    "auth_type": "basic",
+                    "username": "",
+                    "password": "",
+                    "bearer_key": "",
+                    "allow_cookies": false,
+                    "validate_ssl_certificate": false
+                }
+            ],
+            "source_bucket": "Path_Master_Load",
+            "source_scope": "masterdata",
+            "source_collection": "Hospital",
+            "metadata_bucket": "Path_Master_Load",
+            "metadata_scope": "_default",
+            "metadata_collection": "HospitalStorage"
+        },
+        "version": "evt-7.6.6-6126-ee",
+        "enforce_schema": false,
+        "handleruuid": 3625595826,
+        "function_instance_id": "maovA3",
+        "appname": "HospitalRoleSyncer",
+        "settings": {
+            "allow_sync_documents": true,
+            "cursorAware": false,
+            "cursor_aware": false,
+            "dcp_stream_boundary": "everything",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "Syncs hospital document mutations to create/update roles in path-grande-dev3 and path-lite-dev3 with proper channel mappings",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    },
+    {
+        "appcode": "/**** checking only the existence of the practicioner id: (empId) ******/\n\nfunction hasRequiredTxData(patientTxRec, encounterRecord) {\n    try {\n        log(`Inside hasRequiredTxData function`)\n        // Added in-amendment in statusList to moved status to received\n        const statusList = [\"in-amendment\", \"amendment-submitted\", \"amendment-cancelled\", \"amendment-received\", \"received\", \"submitted\", \"cancelled\", \"cancelled-no-billing\", \"entered-in-error\"];\n\n        if (encounterRecord && statusList.includes(encounterRecord.statusTracker.current.value)) {\n            log(\"inside the true case of encounter\");\n            const collectionList = [\"Encounter\"];\n            let practitionerId;\n            for (let i = 0; i < collectionList.length; i++) {\n                if (collectionList[i] === \"Encounter\") {\n                    const encounterData = encounterRecord; \n                    if (encounterData) {\n                        practitionerId = (encounterData.practitioner.current.empId);\n                       // locationId = (encounterData.location[0].location.reference).replace(\"Location/\", \"\");\n                        //patientId = (encounterData.subject.reference).replace(\"Patient/\", \"\");\n                    } else {\n                        console.log(\"Encounter record not found for id \" + patientTxRec.encounterId);\n                        return false;\n                    }\n                } \n            }\n            return true;\n        } else {\n            log(\"Encounter record with id \" + patientTxRec.encounterId + (encounterRecord ? \" status is \" + encounterRecord.statusTracker.current.value : \" not found\"));\n            return false;\n        }\n    } catch (error) {\n        log(`Error in hasRequiredTxData ${error.message} for ptxId: ${patientTxRec.id}`);\n        return false;\n    }\n}\n\n/****complianceAlert Email Notification :: code here ******/\nfunction checkAndInsertComplianceAlert(patientTxRec, serviceTypeIds) {\n    try {\n        return true;\n    } catch (error) {\n        log(`Error in checkAndInsertComplianceAlert ${error.message} for ptxId: ${patientTxRec.id}`);\n    }\n}\n\nfunction updateEncounterRecord(encounterRecord, newCurrentStatus) {\n    const encounterCollectionFQN = `\\`Path_Grande_Dev3\\`.\\`_default\\`.\\`Encounter\\``;\n    var encounteUpdateQuery = `Update ${encounterCollectionFQN} AS target \n                    SET target.\\`statusTracker\\`.\\`history\\`=ARRAY_APPEND(IFMISSINGORNULL(target.\\`statusTracker\\`.\\`history\\`, []), target.\\`statusTracker\\`.\\`current\\`),\n                     target.\\`statusTracker\\`.\\`current\\` = $newCurrentStatus\n                    WHERE target.\\`id\\` = $encounterId AND target.\\`statusTracker\\`.\\`current\\`.\\`value\\` != $status`\n    var queryParameters = { '$newCurrentStatus': newCurrentStatus, '$encounterId': encounterRecord.id, '$status': \"received\" }\n    var results = N1QL(encounteUpdateQuery, queryParameters, { isPrepared: true });\n    results.close();\n}\n\nfunction setExpiryDate(expiryHours) {\n    const date = new Date();\n    date.setHours(date.getHours() + expiryHours);\n    return date.toISOString()\n}\n\nfunction toProcessParentRecord(patientTxParentRec, status) {\n    log(\"Inside toProcessParentRecord function\")\n    var encounterRecord = couchbase.get(encounterCollection, { id: patientTxParentRec.encounterId });\n    encounterRecord = { ...encounterRecord.doc }\n\n    var parentRecord = couchbase.get(patientTreatmentCollection, { \"id\": patientTxParentRec.id })\n    parentRecord = { ...parentRecord.doc }\n\n    var childTxNotReceivedCount = 0;\n    var patientTxCollectionFQN = `\\`Path_Grande_Dev3\\`.\\`_default\\`.\\`TestPtx\\``;\n    var fetchChildTxQuery = `SELECT COUNT(*) AS cnt FROM ${patientTxCollectionFQN} WHERE parent.id =$parentTxId AND displayStatus !=$status`\n    var queryParameters = { '$parentTxId': parentRecord.id, '$status': \"received\" }\n    var fetchChildTxQueryResult = N1QL(fetchChildTxQuery, queryParameters, { isPrepared: true });\n    for (var item of fetchChildTxQueryResult) {   // Stream results using 'for' iterator.\n        childTxNotReceivedCount = item.cnt;\n    }\n    fetchChildTxQueryResult.close(); // End the query and free resources held\n\n    log(\"Child records not in 'received' for parentId \"+parentRecord.id+\" => \"+childTxNotReceivedCount);\n\n    const newCurrentStatus = {\n        value: \"received\",\n        dateTime: new Date().toISOString(),\n    };\n\n    let hasParentValidReceipts = false;\n    let updateParentProperties;\n    // All child records status is received then update the parent record to received status\n    if (childTxNotReceivedCount === 0) {\n        if (parentRecord.displayStatus === status.submittedStatus || parentRecord.displayStatus === status.cancelledStatus) {\n            log(\"Found validReceipts for id is \" + parentRecord.id)\n            hasParentValidReceipts = true;\n            updateParentProperties = { displayStatus: \"received\", treatmentExpiry: setExpiryDate(72) };\n        } else if (parentRecord.displayStatus === status.noBillingStatus || parentRecord.displayStatus === status.enteredInErrorStatus) {\n            log(\"Found validReceipts for id is \" + parentRecord.id)\n            hasParentValidReceipts = true;\n            updateParentProperties = { treatmentExpiry: setExpiryDate(72) };\n        }\n        if (hasParentValidReceipts && updateParentProperties && Object.keys(updateParentProperties).length > 0) {\n            log(\"UpdatedProperties for PatientTreatment collection for id is\" + parentRecord.id);\n            const mutations = Object.entries(updateParentProperties).map(([key, value]) => couchbase.MutateInSpec.upsert(key, value))\n            couchbase.mutateIn(patientTreatmentCollection, { \"id\": parentRecord.id }, mutations);\n            updateEncounterRecord(encounterRecord, newCurrentStatus)\n            log(\"Updated StatusTracker current and history values for Encounter collection for id is \" + encounterRecord.id);\n        }\n    }\n    else{\n        log(\"Not all child records are 'received' yet for parent: \"+parentRecord.id);\n    }\n\n}\n\nfunction OnUpdate(doc, meta, xattrs) {\n    if (doc == null) return; // skip deletes\n\n    log(\"ReceiptStatusChangeFull trigger fired for id: \" + doc.id);\n\n    //Match App-Type:\n    if (!doc.appType || doc.appType !== \"PATH\") {\n        log(\"Skipping ptxId\" + doc.id + \"due to appType mismatch: \" + doc.appType);\n        return;\n    }\n\n    var displayStatuses = [\"submitted\", \"cancelled\", \"cancelled-no-billing\", \"entered-in-error\"];\n    var amendmentDisplayStatuses = [\"amendment-submitted\", \"amendment-cancelled\"];\n\n    if (!((doc.displayStatus && displayStatuses.includes(doc.displayStatus)) || (doc.amendmentDisplayStatus && amendmentDisplayStatuses.includes(doc.amendmentDisplayStatus)))) {\n        log(\"ptxId \" + doc.id + \" does not meet displayStatus/amendmentDisplayStatus conditions.\");\n        return;\n    }\n\n    var status = {\n        submittedStatus: \"submitted\",\n        noBillingStatus: \"cancelled-no-billing\",\n        cancelledStatus: \"cancelled\",\n        enteredInErrorStatus: \"entered-in-error\",\n        amendmentSubmittedStatus: \"amendment-submitted\",\n        amendmentCancelledStatus: \"amendment-cancelled\"\n    };\n    var serviceTypeIds = {\n        HD: \"HWOW1\",\n        APH: \"HWOW3\",\n        NonTx: \"HWOW21\",\n        PDParent: \"HWOW2\", PDTxInitSupport: \"HWOW11\", PDSupport: \"HWOW2\", PDSupportTxEnd: \"HWOW3\", PDTxEnd: \"HWOW4\",\n        CRRTParent: \"HWOW4\", CRRTTxInitRounding: \"HWOW1\", CRRTRounding: \"HWOW2\", CRRTRoundingTxEnd: \"HWOW3\", CRRTTxEnd: \"HWOW11\",\n    };\n    var patientTxId = doc.id;\n    //  var patientTxRec = couchbase.get(patientTxCollection, { \"id\": patientTxId })\n    var patientTxRec = doc;\n\n    var newCurrentStatus = {\n        value: \"received\",\n        dateTime: new Date().toISOString(),\n    };\n\n    var hasValidReceipts = false;\n    var updateProperties;\n    log(\"Processing the patientTreatmentRecord with id\" + doc.id);\n    try{\n       var encounterRecord = couchbase.get(encounterCollection, { id: patientTxRec.encounterId });\n       encounterRecord = { ...encounterRecord.doc }\n      if((hasRequiredTxData(patientTxRec, encounterRecord))){\n        /****complianceAlert Email Notification :: method invokation: ******/\n        if (patientTxRec.displayStatus === status.submittedStatus) {\n                checkAndInsertComplianceAlert(patientTxRec, serviceTypeIds)\n        }\n\n        //  HD, APH, Non-Tx - Modalities:\n        if(!patientTxRec.hasOwnProperty(\"parent\") && \n        [serviceTypeIds.HD, serviceTypeIds.APH, serviceTypeIds.NonTx].includes(patientTxRec.serviceTypeId)){\n          log(\"Processing: HD/APH/Non-Tx Modalities\");\n          // Cancelled-no-billing & EIE\n          // No Receipts applicable\n          if (patientTxRec.displayStatus === status.noBillingStatus || patientTxRec.displayStatus === status.enteredInErrorStatus) {\n              log(\"Found validReceipts for displayStatus:\" + patientTxRec.displayStatus);\n              hasValidReceipts = true;\n              updateProperties = { treatmentExpiry: setExpiryDate(72) };\n              \n          } else if (patientTxRec.displayStatus === status.cancelledStatus || patientTxRec.displayStatus === status.submittedStatus) {\n              // Submitted/ Cancelled case applicable ecmTreatmentAck, ecmBillingAck & cartBillingAck receipts - HWOW-39643\n              if (patientTxRec.ecmTreatmentAck && patientTxRec.ecmTreatmentAck != null && patientTxRec.ecmBillingAck && patientTxRec.ecmBillingAck != null &&\n                    patientTxRec.cartBillingAck && patientTxRec.cartBillingAck != null) {\n                    log(\"Found validReceipts for displayStatus:\" + patientTxRec.displayStatus);\n                    hasValidReceipts = true;\n                    updateProperties = { displayStatus: \"received\", treatmentExpiry: setExpiryDate(72) };\n                }\n            }else if (patientTxRec.amendmentDisplayStatus === status.amendmentSubmittedStatus || patientTxRec.amendmentDisplayStatus === status.amendmentCancelledStatus) {\n                    //Amendment is only applicable to HD, APH and Non-Tx, added as a part of HWOW-50357\n               if (patientTxRec.amendedEcmBillingAck && patientTxRec.amendedEcmBillingAck != null && patientTxRec.amendedEcmTreatmentAck && patientTxRec.amendedEcmTreatmentAck != null) {\n                    log(\"Found validReceipts for amendmentDisplayStatus\" + patientTxRec.amendmentDisplayStatus);\n                    hasValidReceipts = true;\n                    newCurrentStatus.value = \"amendment-received\";\n                    updateProperties = { amendmentDisplayStatus: \"amendment-received\", treatmentExpiry: setExpiryDate(72) };\n                }\n            }\n\n            if (hasValidReceipts && updateProperties && Object.keys(updateProperties).length > 0) {\n                    log(\"UpdatedProperties for PatientTreatment collection for id is\" + patientTxId);\n                    /** Modified as part of HWOW-45357*/\n                    const mutations = Object.entries(updateProperties).map(([key, value]) => couchbase.MutateInSpec.upsert(key, value))\n                    couchbase.mutateIn(patientTreatmentCollection, meta, mutations);\n                    updateEncounterRecord(encounterRecord,newCurrentStatus );\n                    log(\"Updated statusTracker current and history of Encounter collection for id is \" + encounterRecord.id);\n                }\n        }\n         // Process CRRT Parent and PD Parent\n        else if (!patientTxRec.hasOwnProperty(\"parent\") && (patientTxRec.serviceTypeId === serviceTypeIds.CRRTParent || patientTxRec.serviceTypeId === serviceTypeIds.PDParent)) {\n                log(\"Processing: CRRT Parent/PD Parent\");\n                toProcessParentRecord(patientTxRec, status);\n        }// Process CRRT child and PD child\n        else if (patientTxRec.hasOwnProperty(\"parent\")) {\n                log(\"Processing: CRRT/PD Child\");\n                var patientTxParentRec = couchbase.get(patientTreatmentCollection, { \"id\": patientTxRec.parent.id })\n                patientTxParentRec = { ...patientTxParentRec.doc }\n                // PD and CRRT CHILD records process here\n                if (patientTxParentRec && (patientTxParentRec.serviceTypeId === serviceTypeIds.PDParent || patientTxParentRec.serviceTypeId === serviceTypeIds.CRRTParent)) {\n                    // This is for identify the child records\n                    // Process all child records here\n                    if (patientTxRec.parent) {\n                        if (patientTxRec.displayStatus === status.noBillingStatus || patientTxRec.displayStatus === status.enteredInErrorStatus) {\n                            log(\"Found validReceipts for displayStatus\" + patientTxRec.displayStatus)\n                            hasValidReceipts = true;\n                            updateProperties = { treatmentExpiry: setExpiryDate(72) };\n                            //updated as a part of HWOW-46544\n                        }\n                        else if (patientTxRec.displayStatus === status.submittedStatus || patientTxRec.displayStatus === status.cancelledStatus) {\n                            // Processing CRRT & PD Childs here - like TxInitRounding/Support & Rounding/Support & TxEnd\n                            if (patientTxRec.ecmTreatmentAck && patientTxRec.ecmTreatmentAck != null && patientTxRec.ecmBillingAck && patientTxRec.ecmBillingAck != null &&\n                                patientTxRec.cartBillingAck && patientTxRec.cartBillingAck != null) {\n                                log(\"Found validReceipts for displayStatus\" + patientTxRec.displayStatus)\n                                hasValidReceipts = true;\n                                updateProperties = { displayStatus: \"received\", treatmentExpiry: setExpiryDate(72) };\n                            }\n                        }\n\n                        if (hasValidReceipts && updateProperties && Object.keys(updateProperties).length > 0) {\n                            log(\"UpdatedProperties for PatientTreatment record id:\" + patientTxRec.id);\n                            const mutations = Object.entries(updateProperties).map(([key, value]) => couchbase.MutateInSpec.upsert(key, value))\n                            couchbase.mutateIn(patientTreatmentCollection, meta, mutations);\n                            updateEncounterRecord(encounterRecord,newCurrentStatus );\n                            log(\"Updated statusTracker current and history for Encounter collection for id is \" + encounterRecord.id);\n                        }\n                        // Process CRRT Parent and PD Parent\n                        toProcessParentRecord(patientTxParentRec, status);\n                    } else {\n                        log(\"Parent record not found or serviceId didn't match for id \" + patientTxRec.parent);\n                    }\n                }\n            }\n        }\n        else {\n            log(\"Data not yet synced for patient treatment \" + patientTxRec.id + \" and encounterId \" + patientTxRec.encounterId);\n        }\n    }catch (error) {\n        log(`Error in receiptStatusChange ${error.message} for ptxId: ${doc.id}`);\n    }\n}",
+        "depcfg": {
+            "buckets": [
+                {
+                    "alias": "encounterCollection",
+                    "bucket_name": "Path_Grande_Dev3",
+                    "scope_name": "_default",
+                    "collection_name": "Encounter",
+                    "access": "rw"
+                },
+                {
+                    "alias": "patientTreatmentCollection",
+                    "bucket_name": "Path_Grande_Dev3",
+                    "scope_name": "_default",
+                    "collection_name": "TestPtx",
+                    "access": "rw"
+                }
+            ],
+            "source_bucket": "Path_Grande_Dev3",
+            "source_scope": "_default",
+            "source_collection": "TestPtx",
+            "metadata_bucket": "Path_Grande_Dev3",
+            "metadata_scope": "_default",
+            "metadata_collection": "ReceiptFullStorage"
+        },
+        "version": "evt-7.6.7-6706-ee",
+        "enforce_schema": false,
+        "handleruuid": 4228627646,
+        "function_instance_id": "wC6m&3",
+        "appname": "ReceiptStatusChangeFull",
+        "settings": {
+            "allow_sync_documents": true,
+            "cursorAware": false,
+            "cursor_aware": false,
+            "dcp_stream_boundary": "from_now",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    },
+    {
+        "appcode": "function OnUpdate(doc, meta, xattrs) {\n   log(\"sample function - Received updated doc from Eventing :\", doc.id);\n   try {\n      var query = `EXECUTE FUNCTION \\`Path_Master_Dev3\\`.\\`_default\\`.sample(['select * from something1;', 'select * from something2']);`;\n      var result = N1QL(query);\n\n      // var query = N1QL(`EXECUTE FUNCTION \\`Path_Master_Dev3\\`.\\`_default\\`.sample([])`);\n      for (var item of result) {   // Stream results using 'for' iterator.\n        log(\"item\", item);\n      }\n      log(\"sample function - Execution completed******1111\", result);\n   } catch (e) {\n      log(e);\n   }\n}\n\nfunction OnDelete(meta, options) {\n   log(\"Doc deleted/expired\", meta.id);\n}",
+        "depcfg": {
+            "source_bucket": "Path_Master_Load",
+            "source_scope": "masterdata",
+            "source_collection": "Medispan",
+            "metadata_bucket": "Path_Master_Load",
+            "metadata_scope": "_default",
+            "metadata_collection": "HospitalStorage"
+        },
+        "version": "evt-7.6.7-6706-ee",
+        "enforce_schema": false,
+        "handleruuid": 2614319043,
+        "function_instance_id": "h1RvF2",
+        "appname": "sample",
+        "settings": {
+            "allow_sync_documents": false,
+            "cursorAware": true,
+            "cursor_aware": true,
+            "dcp_stream_boundary": "from_now",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "sample",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    },
+    {
+        "appcode": "function OnUpdate(doc, meta, xattrs) {\n    log(\"📄 PatientRecallInfo Eventing Triggered for doc:\", meta.id);\n\n    try {\n        // Run the UDF using EXECUTE FUNCTION inside a N1QL query\n        var query = N1QL(`\n            EXECUTE FUNCTION Path_Lite_Dev3.treatment.PatientRecallInfo();\n        `);\n\n        log(\"✅ PatientRecallInfo UDF executed successfully for doc:\", meta.id, \"Result:\", query);\n    } catch (e) {\n        log(\"❌ Error while executing PatientRecallInfo UDF for doc:\", meta.id, e);\n    }\n}\n\nfunction OnDelete(meta, options) {\n    log(\"🗑️ Document deleted or expired:\", meta.id);\n}\n",
+        "depcfg": {
+            "source_bucket": "Path_Lite_Dev3",
+            "source_scope": "treatment",
+            "source_collection": "PatientRecallInfo",
+            "metadata_bucket": "Path_Lite_Dev3",
+            "metadata_scope": "_default",
+            "metadata_collection": "UDFPatientTesting"
+        },
+        "version": "evt-7.6.7-6706-ee",
+        "enforce_schema": false,
+        "handleruuid": 2697723650,
+        "function_instance_id": "4FPHe1",
+        "appname": "PatientRecallInfoTrigger",
+        "settings": {
+            "allow_sync_documents": false,
+            "cursorAware": true,
+            "cursor_aware": true,
+            "dcp_stream_boundary": "everything",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "Triggers PatientRecallInfo UDF on document changes",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    },
+    {
+        "appcode": "function OnUpdate(doc, meta, xattrs) {\n   if (!doc) return; // skip deletes\n   log(\"Triggered for PatientTreatment id=\" + meta.id);\n   //   Validate status\n   if (!isValidStatus(doc)) {\n      log(\"Doc \" + meta.id + \" skipped: invalid processedStatus/amendmentDisplayStatus.\");\n      return;\n   }\n   // 2️ Check recall eligibility\n   if (!isRecallEligible(doc)) {\n      log(\"Doc \" + meta.id + \" skipped: not eligible for recall.\");\n      return;\n   }\n\n   try{\n      var query=`\n      EXECUTE FUNCTION \\`Path_Grande_Dev3\\`.\\`_default\\`.PtxRecallUDFTest($docStr, $metaInfo, $parentId);\n      `;\n      //pass params:\n      const params={\n         docStr : doc,\n         metaInfo : meta,\n         parentId: \"pt::1111\"\n      }\n      var result = N1QL(query, params);\n      log(\"Direct Result printing: \"+JSON.stringify(result));\n      var res = [];\n      //var res2=[];\n      for(var row of result){\n         log(\"Stringified Row: \"+JSON.stringify(row));\n         res.push(row[0]);\n      //  res.push(row.result); // [{\"metaId\":\"pt::011\",\"processedStatus\":\"submitted\",\"role\":\"role_tx_admin\"}] \n      }\n     \n      log(\"Stringified Res :\"+JSON.stringify(res));\n      log(\"Non-Stringied Res :\"+res);\n      //close the result stream ::\n      result.close();\n   }catch(err){\n      log(\"Eventing error message:\"+JSON.stringify(err));\n   }\n}\n//Helper functions:\n//1 Valid Statuses\nfunction isValidStatus(doc) {\n    var validProcessedStatuses = [\"submitted\"];\n    var validAmendmentStatuses = [\"amendment-submitted\"];\n\n    var statusCondition = doc.processedStatus && validProcessedStatuses.includes(doc.processedStatus);\n    var amendmentCondition = doc.amendmentDisplayStatus && validAmendmentStatuses.includes(doc.amendmentDisplayStatus);\n\n    return statusCondition || amendmentCondition;\n}\n// 2️ Check recall eligibility (includes parent treatments)\nfunction isRecallEligible(doc) {\n    var eligibleServices = [\"Hemodialysis\", \"Apheresis\", \"Non-Treatment Service(s)\"];\n    var optionA = doc.serviceType && eligibleServices.includes(doc.serviceType) && doc.patientRecallAdditionalInfo && doc.patientRecallAdditionalInfo!==null;\n    var optionB = doc.parent; // PD/CRRT parent treatments\n    return optionA || optionB;\n}\n    ",
+        "depcfg": {
+            "source_bucket": "Path_Grande_Dev3",
+            "source_scope": "_default",
+            "source_collection": "PtxUDF",
+            "metadata_bucket": "Path_Grande_Dev3",
+            "metadata_scope": "_default",
+            "metadata_collection": "PtxUDFStorage"
+        },
+        "version": "evt-7.6.7-6706-ee",
+        "enforce_schema": false,
+        "handleruuid": 504213369,
+        "function_instance_id": "P5DQz",
+        "appname": "PatientRecallUDFTesting",
+        "settings": {
+            "allow_sync_documents": true,
+            "cursorAware": false,
+            "cursor_aware": false,
+            "dcp_stream_boundary": "from_now",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    },
+    {
+        "appcode": "function OnUpdate(doc, meta, xattrs) {\n    try {\n        log(\"Received updated doc from Eventing:\", meta.id);\n\n        // Execute your UDF\n        var query = \"EXECUTE FUNCTION Path_Lite_Dev3.treatment.sample3();\";\n        var result = N1QL(query);\n\n        if (result && result.results && result.results.length > 0) {\n            log(\" UDF executed successfully. Result:\", result.results[0]);\n        } else {\n            log(\"UDF executed but returned no results:\", JSON.stringify(result));\n        }\n\n    } catch (e) {\n        log(\" Error executing UDF from Eventing:\", e);\n    }\n}\n\nfunction OnDelete(meta, options) {\n    log(\"Doc deleted/expired:\", meta.id);\n}\n",
+        "depcfg": {
+            "source_bucket": "Path_Lite_Dev3",
+            "source_scope": "treatment",
+            "source_collection": "PatientRecallInfo",
+            "metadata_bucket": "Path_Lite_Dev3",
+            "metadata_scope": "_default",
+            "metadata_collection": "UDFPatientTesting"
+        },
+        "version": "evt-7.6.7-6706-ee",
+        "enforce_schema": false,
+        "handleruuid": 2986293007,
+        "function_instance_id": "I4ooF3",
+        "appname": "sample3",
+        "settings": {
+            "allow_sync_documents": false,
+            "cursorAware": true,
+            "cursor_aware": true,
+            "dcp_stream_boundary": "everything",
+            "deadline_timeout": 62,
+            "deployment_status": false,
+            "description": "Triggers PatientRecallInfo UDF on document changes",
+            "execution_timeout": 60,
+            "language_compatibility": "7.2.0",
+            "log_level": "INFO",
+            "n1ql_consistency": "none",
+            "num_timer_partitions": 128,
+            "processing_status": false,
+            "timer_context_size": 1024,
+            "user_prefix": "eventing",
+            "worker_count": 1
+        },
+        "function_scope": {
+            "bucket": "*",
+            "scope": "*"
+        }
+    }
+]
