@@ -7,15 +7,13 @@ import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.kstream.*;
 import org.apache.kafka.streams.state.KeyValueStore;
-import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
-import org.apache.kafka.streams.state.Materialized;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.event.EventListener;
 import org.springframework.kafka.annotation.EnableKafkaStreams;
 import org.springframework.kafka.annotation.KafkaStreamsDefaultConfiguration;
 import org.springframework.kafka.config.KafkaStreamsConfiguration;
-import org.springframework.context.event.EventListener;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -48,8 +46,6 @@ public class DedupStreamsApplication {
         this.kafkaStreams = kafkaStreams;
     }
 
-    private final Map<String, ReadOnlyKeyValueStore<String, String>> storeCache = new HashMap<>();
-
     @Bean
     public KStream<String, String> buildDedupStream(StreamsBuilder builder) {
         DedupTopicMapper mapper = new DedupTopicMapper("dedup-mapping.properties");
@@ -59,35 +55,38 @@ public class DedupStreamsApplication {
             String dedupTopic = mapping.dedupTopic;
             String outputTopic = mapping.outputTopic;
 
-            // Register the global table ONCE
-            KTable<String, String> globalTable = builder.globalTable(
+            // Create and reuse the GlobalKTable for deduplication
+            GlobalKTable<String, String> dedupTable = builder.globalTable(
                 dedupTopic,
                 Consumed.with(Serdes.String(), Serdes.String()),
-                Materialized.<String, String, KeyValueStore<Bytes, String>>as(dedupTopic)
-                    .withKeySerde(Serdes.String())
-                    .withValueSerde(Serdes.String())
+                Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as(dedupTopic)
+                          .withLoggingEnabled()
             );
 
-            // Input stream
+            // Stream from the input topic
             KStream<String, String> stream = builder.stream(
                 inputTopic,
                 Consumed.with(Serdes.String(), Serdes.String())
             );
 
-            // Deduplication logic using leftJoin
+            // Deduplicate using the GlobalKTable
             KStream<String, String> deduped = stream.leftJoin(
-                globalTable,
+                dedupTable,
                 (key, value) -> key,
                 (value, existingHash) -> {
                     String newHash = computeHash(value);
-                    return (existingHash == null || !existingHash.equals(newHash)) ? value : null;
+                    if (existingHash == null || !existingHash.equals(newHash)) {
+                        return value;
+                    } else {
+                        return null;
+                    }
                 }
             ).filter((k, v) -> v != null);
 
-            // Write unique records to output topic
+            // Publish deduplicated records to output topic
             deduped.to(outputTopic, Produced.with(Serdes.String(), Serdes.String()));
 
-            // Write hash values to dedup topic
+            // Update the dedup hash topic
             deduped.mapValues(DedupStreamsApplication::computeHash)
                    .to(dedupTopic, Produced.with(Serdes.String(), Serdes.String()));
         }
