@@ -1,25 +1,3 @@
-package com.path.stream.app;
-
-import org.apache.kafka.common.serialization.Serdes;
-import org.apache.kafka.common.utils.Bytes;
-import org.apache.kafka.streams.KafkaStreams;
-import org.apache.kafka.streams.StreamsBuilder;
-import org.apache.kafka.streams.StreamsConfig;
-import org.apache.kafka.streams.kstream.*;
-import org.apache.kafka.streams.state.*;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.context.annotation.Bean;
-import org.springframework.kafka.annotation.KafkaStreamsDefaultConfiguration;
-import org.springframework.kafka.config.KafkaStreamsConfiguration;
-
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.Base64;
-import java.util.HashMap;
-import java.util.Map;
-
 @SpringBootApplication
 public class DedupStreamsApplication {
 
@@ -37,8 +15,14 @@ public class DedupStreamsApplication {
         return new KafkaStreamsConfiguration(props);
     }
 
-    @Autowired
+    // ✅ Replace field injection with this
     private KafkaStreams kafkaStreams;
+
+    // ✅ Listen for KafkaStreams bean when it's ready
+    @EventListener
+    public void onKafkaStreamsReady(KafkaStreams kafkaStreams) {
+        this.kafkaStreams = kafkaStreams;
+    }
 
     private final Map<String, ReadOnlyKeyValueStore<String, String>> storeCache = new HashMap<>();
 
@@ -51,19 +35,15 @@ public class DedupStreamsApplication {
             String dedupTopic = mapping.dedupTopic;
             String outputTopic = mapping.outputTopic;
 
-            // Create global store for deduplication
             builder.globalTable(dedupTopic,
                 Consumed.with(Serdes.String(), Serdes.String()),
                 Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as(dedupTopic).withLoggingDisabled());
 
-            // Stream from input topic
             KStream<String, String> stream = builder.stream(inputTopic, Consumed.with(Serdes.String(), Serdes.String()));
 
-            // Filter out duplicates
             stream.filter((key, value) -> shouldEmit(key, value, dedupTopic))
                   .to(outputTopic, Produced.with(Serdes.String(), Serdes.String()));
 
-            // Store hash for future deduplication
             stream.mapValues(DedupStreamsApplication::computeHash)
                   .to(dedupTopic, Produced.with(Serdes.String(), Serdes.String()));
         }
@@ -72,6 +52,8 @@ public class DedupStreamsApplication {
     }
 
     private boolean shouldEmit(String key, String value, String storeName) {
+        if (kafkaStreams == null) return true; // fallback if not ready
+
         ReadOnlyKeyValueStore<String, String> store = storeCache.computeIfAbsent(storeName, name ->
             kafkaStreams.store(name, QueryableStoreTypes.keyValueStore())
         );
