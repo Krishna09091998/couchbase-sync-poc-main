@@ -1,31 +1,31 @@
-package com.example;
+package com.path.stream.app;
 
-import java.io.*;
+import java.io.FileInputStream;
+import java.io.IOException;
 import java.util.*;
 
 public class DedupTopicMapper {
-    private final Map<String, TopicMapping> topicMap = new HashMap<>();
+    private final Properties mappings = new Properties();
 
-    public DedupTopicMapper(String mappingFilePath) throws IOException {
-        Properties props = new Properties();
-        try (InputStream input = new FileInputStream(mappingFilePath)) {
-            props.load(input);
+    public DedupTopicMapper(String filePath) {
+        try (FileInputStream fis = new FileInputStream(filePath)) {
+            mappings.load(fis);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to load mapping file", e);
         }
-
-        for (String inputTopic : props.stringPropertyNames()) {
-            String[] parts = props.getProperty(inputTopic).split(",");
-            if (parts.length == 2) {
-                topicMap.put(inputTopic, new TopicMapping(parts[0], parts[1]));
-            }
-        }
-    }
-
-    public TopicMapping getMapping(String inputTopic) {
-        return topicMap.get(inputTopic);
     }
 
     public Set<String> getAllInputTopics() {
-        return topicMap.keySet();
+        return mappings.stringPropertyNames();
+    }
+
+    public TopicMapping getMapping(String inputTopic) {
+        String value = mappings.getProperty(inputTopic);
+        String[] parts = value.split(",");
+        if (parts.length != 2) {
+            throw new IllegalArgumentException("Invalid mapping for topic: " + inputTopic);
+        }
+        return new TopicMapping(parts[0].trim(), parts[1].trim());
     }
 
     public static class TopicMapping {
