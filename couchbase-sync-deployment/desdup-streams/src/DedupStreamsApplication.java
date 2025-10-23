@@ -6,7 +6,9 @@ import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.kstream.*;
-import org.apache.kafka.streams.state.*;
+import org.apache.kafka.streams.state.KeyValueStore;
+import org.apache.kafka.streams.state.QueryableStoreTypes;
+import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -40,15 +42,14 @@ public class DedupStreamsApplication {
         return new KafkaStreamsConfiguration(props);
     }
 
-    // ✅ Replace field injection with this
     private KafkaStreams kafkaStreams;
 
-    // ✅ Listen for KafkaStreams bean when it's ready
     @EventListener
     public void onKafkaStreamsReady(KafkaStreams kafkaStreams) {
         this.kafkaStreams = kafkaStreams;
     }
 
+    // Store cache per dedup topic
     private final Map<String, ReadOnlyKeyValueStore<String, String>> storeCache = new HashMap<>();
 
     @Bean
@@ -57,36 +58,46 @@ public class DedupStreamsApplication {
 
         for (String inputTopic : mapper.getAllInputTopics()) {
             DedupTopicMapper.TopicMapping mapping = mapper.getMapping(inputTopic);
-            String dedupTopic = mapping.dedupTopic;
-            String outputTopic = mapping.outputTopic;
+            String dedupTopic = mapping.dedupTopic;      // compact topic for hashes
+            String outputTopic = mapping.outputTopic;    // connector-specific output topic
 
-            builder.globalTable(dedupTopic,
+            // ✅ Create a GlobalKTable per dedupTopic
+            builder.globalTable(
+                dedupTopic,
                 Consumed.with(Serdes.String(), Serdes.String()),
-                Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as(dedupTopic).withLoggingDisabled());
+                Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as(dedupTopic)
+                          .withLoggingEnabled() // ensures state recovery
+            );
 
-            KStream<String, String> stream = builder.stream(inputTopic, Consumed.with(Serdes.String(), Serdes.String()));
+            // Stream from the input topic
+            KStream<String, String> stream = builder.stream(
+                inputTopic,
+                Consumed.with(Serdes.String(), Serdes.String())
+            );
 
-            stream.filter((key, value) -> shouldEmit(key, value, dedupTopic))
-                  .to(outputTopic, Produced.with(Serdes.String(), Serdes.String()));
+            // Deduplication filter using the GlobalKTable synchronously
+            KStream<String, String> deduped = stream.leftJoin(
+                builder.globalTable(dedupTopic, Consumed.with(Serdes.String(), Serdes.String())),
+                (key, value) -> key, // key selector for join
+                (value, existingHash) -> {
+                    String newHash = computeHash(value);
+                    if (existingHash == null || !existingHash.equals(newHash)) {
+                        return value; // not a duplicate
+                    } else {
+                        return null;  // duplicate
+                    }
+                }
+            ).filter((k, v) -> v != null);
 
-            stream.mapValues(DedupStreamsApplication::computeHash)
-                  .to(dedupTopic, Produced.with(Serdes.String(), Serdes.String()));
+            // Publish unique records to the connector-specific output topic
+            deduped.to(outputTopic, Produced.with(Serdes.String(), Serdes.String()));
+
+            // Update the dedup hash compact topic
+            deduped.mapValues(DedupStreamsApplication::computeHash)
+                   .to(dedupTopic, Produced.with(Serdes.String(), Serdes.String()));
         }
 
         return null;
-    }
-
-    private boolean shouldEmit(String key, String value, String storeName) {
-        if (kafkaStreams == null) return true; // fallback if not ready
-
-        ReadOnlyKeyValueStore<String, String> store = storeCache.computeIfAbsent(storeName, name ->
-            kafkaStreams.store(name, QueryableStoreTypes.keyValueStore())
-        );
-
-        String newHash = computeHash(value);
-        String oldHash = store.get(key);
-
-        return oldHash == null || !newHash.equals(oldHash);
     }
 
     private static String computeHash(String json) {
