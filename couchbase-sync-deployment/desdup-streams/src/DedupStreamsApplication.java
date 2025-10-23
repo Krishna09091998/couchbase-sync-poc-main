@@ -7,16 +7,16 @@ import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.kstream.*;
 import org.apache.kafka.streams.state.KeyValueStore;
+import org.apache.kafka.streams.state.Materialized;
 import org.apache.kafka.streams.state.QueryableStoreTypes;
 import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
+import org.springframework.kafka.annotation.EnableKafkaStreams;
 import org.springframework.kafka.annotation.KafkaStreamsDefaultConfiguration;
 import org.springframework.kafka.config.KafkaStreamsConfiguration;
 import org.springframework.context.event.EventListener;
-import org.springframework.kafka.annotation.EnableKafkaStreams;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -58,38 +58,41 @@ public class DedupStreamsApplication {
 
         for (String inputTopic : mapper.getAllInputTopics()) {
             DedupTopicMapper.TopicMapping mapping = mapper.getMapping(inputTopic);
-            String dedupTopic = mapping.dedupTopic;      // compact topic for hashes
+            String dedupTopic = mapping.dedupTopic;      // compact topic for storing hashes
             String outputTopic = mapping.outputTopic;    // connector-specific output topic
 
-            // ✅ Create a GlobalKTable per dedupTopic
-            builder.globalTable(
-                dedupTopic,
-                Consumed.with(Serdes.String(), Serdes.String()),
-                Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as(dedupTopic)
-                          .withLoggingEnabled() // ensures state recovery
+            // ✅ Create a single GlobalTable per dedupTopic
+            Materialized<String, String, KeyValueStore<Bytes, byte[]>> materialized =
+                    Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as(dedupTopic)
+                            .withLoggingEnabled(new HashMap<>()); // enable changelog for persistence
+
+            KTable<String, String> globalTable = builder.globalTable(
+                    dedupTopic,
+                    Consumed.with(Serdes.String(), Serdes.String()),
+                    materialized
             );
 
             // Stream from the input topic
             KStream<String, String> stream = builder.stream(
-                inputTopic,
-                Consumed.with(Serdes.String(), Serdes.String())
+                    inputTopic,
+                    Consumed.with(Serdes.String(), Serdes.String())
             );
 
-            // Deduplication filter using the GlobalKTable synchronously
+            // Deduplication using the GlobalTable
             KStream<String, String> deduped = stream.leftJoin(
-                builder.globalTable(dedupTopic, Consumed.with(Serdes.String(), Serdes.String())),
-                (key, value) -> key, // key selector for join
-                (value, existingHash) -> {
-                    String newHash = computeHash(value);
-                    if (existingHash == null || !existingHash.equals(newHash)) {
-                        return value; // not a duplicate
-                    } else {
-                        return null;  // duplicate
+                    globalTable,
+                    (key, value) -> key, // key selector
+                    (value, existingHash) -> {
+                        String newHash = computeHash(value);
+                        if (existingHash == null || !existingHash.equals(newHash)) {
+                            return value; // unique record
+                        } else {
+                            return null; // duplicate
+                        }
                     }
-                }
             ).filter((k, v) -> v != null);
 
-            // Publish unique records to the connector-specific output topic
+            // Publish unique records to the output topic
             deduped.to(outputTopic, Produced.with(Serdes.String(), Serdes.String()));
 
             // Update the dedup hash compact topic
@@ -100,10 +103,10 @@ public class DedupStreamsApplication {
         return null;
     }
 
-    private static String computeHash(String json) {
+    private static String computeHash(String value) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(json.getBytes(StandardCharsets.UTF_8));
+            byte[] hash = digest.digest(value.getBytes(StandardCharsets.UTF_8));
             return Base64.getEncoder().encodeToString(hash);
         } catch (Exception e) {
             return "";
