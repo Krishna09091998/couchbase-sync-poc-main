@@ -36,6 +36,9 @@ public class DedupStreamsApplication {
         props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
         props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
         props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        // Make updates visible faster (reduce buffering). Use with caution for throughput.
+        props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 500L);
+        props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 0);
         return new KafkaStreamsConfiguration(props);
     }
 
@@ -46,8 +49,12 @@ public class DedupStreamsApplication {
         this.kafkaStreams = kafkaStreams;
     }
 
+    /**
+     * Build topology. Use void since we create multiple streams inside the loop.
+     */
     @Bean
-    public KStream<String, String> buildDedupStream(StreamsBuilder builder) {
+    public void buildDedupStream(StreamsBuilder builder) {
+        // Your mapper - assumed to provide inputTopic -> mapping (dedupTopic, outputTopic)
         DedupTopicMapper mapper = new DedupTopicMapper("dedup-mapping.properties");
 
         for (String inputTopic : mapper.getAllInputTopics()) {
@@ -55,51 +62,53 @@ public class DedupStreamsApplication {
             String dedupTopic = mapping.dedupTopic;
             String outputTopic = mapping.outputTopic;
 
-            // Create and reuse the GlobalKTable for deduplication
-            GlobalKTable<String, String> dedupTable = builder.globalTable(
+            // Create a KTable (partition-local, synchronous)
+            KTable<String, String> dedupTable = builder.table(
                 dedupTopic,
                 Consumed.with(Serdes.String(), Serdes.String()),
                 Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as(dedupTopic)
-                          .withLoggingEnabled()
+                    .withKeySerde(Serdes.String())
+                    .withValueSerde(Serdes.String())
+                    .withLoggingEnabled(new HashMap<>()) // enable changelog (default settings)
             );
 
-            // Stream from the input topic
+            // Stream from input topic
             KStream<String, String> stream = builder.stream(
                 inputTopic,
                 Consumed.with(Serdes.String(), Serdes.String())
             );
 
-            // Deduplicate using the GlobalKTable
+            // Dedup: leftJoin stream with the partition-local KTable
             KStream<String, String> deduped = stream.leftJoin(
                 dedupTable,
-                (key, value) -> key,
+                (key, value) -> key, // use same key for lookup
                 (value, existingHash) -> {
                     String newHash = computeHash(value);
                     if (existingHash == null || !existingHash.equals(newHash)) {
-                        return value;
+                        return value; // new/changed -> pass through
                     } else {
-                        return null;
+                        return null; // duplicate -> drop
                     }
                 }
-            ).filter((k, v) -> v != null);
+            ).filter((k, v) -> v != null); // remove nulls (duplicates)
 
             // Publish deduplicated records to output topic
             deduped.to(outputTopic, Produced.with(Serdes.String(), Serdes.String()));
 
-            // Update the dedup hash topic
+            // Update the dedup hash topic with new hash values (key stays same)
             deduped.mapValues(DedupStreamsApplication::computeHash)
                    .to(dedupTopic, Produced.with(Serdes.String(), Serdes.String()));
         }
-
-        return null;
     }
 
     private static String computeHash(String json) {
+        if (json == null) return "";
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] hash = digest.digest(json.getBytes(StandardCharsets.UTF_8));
             return Base64.getEncoder().encodeToString(hash);
         } catch (Exception e) {
+            // log error in real code
             return "";
         }
     }
