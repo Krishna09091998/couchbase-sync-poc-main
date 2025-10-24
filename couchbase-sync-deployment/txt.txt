@@ -1,0 +1,100 @@
+Title: Kafka Streams Deduplication Approach
+
+---
+
+## 1. Problem Statement
+
+* Duplicates are appearing in Kafka due to Couchbase AppServices sync functions.
+* Previously used static RocksDB store for deduplication, which could lose state if the pod moved.
+* Client requested to avoid static stores and use Kafka-backed persistent store.
+
+---
+
+## 2. Solution Overview
+
+* Implemented a Kafka Streams Transformer with a **persistent state store** (RocksDB).
+* Deduplication is **synchronous per record**: atomic read → compare → update → emit.
+* Persistent store is backed by **changelog topic** for fault tolerance and state restoration.
+
+**Transformer logic:**
+
+```java
+if (oldHash == null || !MessageDigest.isEqual(oldHash, newHash)) {
+    store.put(key, newHash);
+    return value; // pass through
+} else {
+    return null; // drop duplicate
+}
+```
+
+---
+
+## 3. Handling Pod Movement / Instance Changes
+
+* When a pod moves or restarts:
+
+  1. Local RocksDB state is initially missing.
+  2. Kafka Streams restores the state store from **changelog topic**.
+  3. Deduplication resumes correctly after restore.
+* **Temporary duplicates** may occur during the restore window.
+
+---
+
+## 4. Edge Cases Covered
+
+| Scenario                             | Covered? | Notes                                                                          |
+| ------------------------------------ | -------- | ------------------------------------------------------------------------------ |
+| Duplicate events within milliseconds | ✅        | Synchronous transformer ensures atomic deduplication.                          |
+| Multiple instances / partitions      | ✅        | Each partition has its own local store; keys must be consistently keyed.       |
+| Pod restart / failure                | ✅        | Persistent store + changelog allows state restoration.                         |
+| Deduplication across partitions      | ⚠️       | Works per key per partition; cross-partition dedup requires consistent keying. |
+| High volume topics                   | ✅        | RocksDB handles millions of keys; monitor disk growth.                         |
+| Avoid static in-memory stores        | ✅        | Persistent RocksDB + changelog replaces static store.                          |
+
+---
+
+## 5. Pros
+
+* Atomic deduplication (read → update → emit).
+* Persistent and fault-tolerant (works across pod restarts/rebalances).
+* Scales with multiple instances (with proper key partitioning).
+* Kafka-native solution, no external DB required.
+
+---
+
+## 6. Cons / Limitations
+
+* Partition-local deduplication: duplicates may appear across partitions.
+* Temporary duplicates during state restore.
+* Disk usage grows with number of unique keys.
+* Changelog topic can grow large over time.
+* Restore can be slow for very large state stores.
+
+---
+
+## 7. Key Considerations
+
+1. **Consistent keying**: ensure all events for a document use the same key so they go to the same partition.
+2. **Persistent store**: necessary for pod failover scenarios.
+3. **Changelog topic retention**: must retain all updates until state restore is complete.
+4. **Monitoring**: monitor RocksDB disk usage and changelog topic size.
+
+---
+
+## 8. Testing Locally
+
+1. Set up Kafka topic with multiple partitions (e.g., 3 partitions).
+2. Run multiple Kafka Streams instances locally.
+3. Produce test messages with consistent keys.
+4. Stop one instance to simulate pod failure.
+5. Produce more messages and restart the instance to simulate pod movement.
+6. Observe deduplication and state restoration.
+
+---
+
+## 9. Summary
+
+* Your current code **meets the client requirement**: avoids static stores, uses Kafka-backed persistent store, synchronous deduplication.
+* Deduplication works per key per partition and survives pod movement or restarts.
+* Temporary duplicates are possible during state restore.
+* Proper key partitioning is crucial to ensure deduplication works as expected.
