@@ -92,9 +92,49 @@ if (oldHash == null || !MessageDigest.isEqual(oldHash, newHash)) {
 
 ---
 
-## 9. Summary
+## 9. Alternative Kafka Streams Solutions for Deduplication
 
-* Your current code **meets the client requirement**: avoids static stores, uses Kafka-backed persistent store, synchronous deduplication.
+### 1. Persistent Local Store (RocksDB) with Transformer
+
+* Synchronous transformer with persistent state store.
+* Stores hash per key, compares and updates atomically.
+* Pros: atomic, fault-tolerant, Kafka-native.
+* Cons: partition-local, disk usage grows with unique keys, temporary duplicates during restore.
+
+### 2. KTable
+
+* Maintains key → hash in a KTable, left-join with stream to filter duplicates.
+* Pros: simple, declarative, Kafka maintains changelog.
+* Cons: eventually consistent, partition-local, may see duplicates in high-frequency scenarios.
+
+### 3. GlobalKTable
+
+* Full table replicated on all instances, dedup visible across partitions.
+* Pros: cross-partition deduplication, no local store dependency.
+* Cons: asynchronous updates, high memory usage, not scalable for very large datasets.
+
+### 4. Windowed Deduplication
+
+* Use time windows and store seen keys within the window.
+* Pros: limits memory/disk, good for temporal duplicates.
+* Cons: only deduplicates within window, not long-term.
+
+### 5. External Shared Store
+
+* Use Redis/Cassandra/DynamoDB to store key → hash.
+* Pros: true global deduplication.
+* Cons: external dependency, latency, throughput limits.
+
+**Recommendation:**
+
+* For your scenario: **Persistent Transformer Store (RocksDB)** is preferred, optionally **GlobalKTable** if cross-partition dedup is critical.
+* Ensure consistent keying, monitor disk usage, and accept temporary duplicates during restore.
+
+---
+
+## 10. Summary
+
+* Your current code meets the client requirement: avoids static stores, uses Kafka-backed persistent store, synchronous deduplication.
 * Deduplication works per key per partition and survives pod movement or restarts.
-* Temporary duplicates are possible during state restore.
+* Temporary duplicates may occur during state restore.
 * Proper key partitioning is crucial to ensure deduplication works as expected.
