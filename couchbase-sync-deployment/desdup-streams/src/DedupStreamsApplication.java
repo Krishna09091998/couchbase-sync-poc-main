@@ -6,9 +6,10 @@ import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.kstream.*;
+import org.apache.kafka.streams.processor.ProcessorContext;
+import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.state.KeyValueStore;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.kafka.streams.state.Stores;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
@@ -27,8 +28,6 @@ import java.util.Map;
 @EnableKafkaStreams
 public class DedupStreamsApplication {
 
-    private static final Logger log = LoggerFactory.getLogger(DedupStreamsApplication.class);
-
     public static void main(String[] args) {
         SpringApplication.run(DedupStreamsApplication.class, args);
     }
@@ -41,7 +40,7 @@ public class DedupStreamsApplication {
         props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
         props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
         props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 500L); // faster commit
-        props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 0); // disable cache for instant state visibility
+        props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 0);
         return new KafkaStreamsConfiguration(props);
     }
 
@@ -50,70 +49,85 @@ public class DedupStreamsApplication {
     @EventListener
     public void onKafkaStreamsReady(KafkaStreams kafkaStreams) {
         this.kafkaStreams = kafkaStreams;
-        log.info("Kafka Streams instance ready");
     }
 
     @Bean
     public KStream<String, String> buildDedupStream(StreamsBuilder builder) {
+
         DedupTopicMapper mapper = new DedupTopicMapper("dedup-mapping.properties");
-        KStream<String, String> lastStream = null;
+
+        // Build persistent KeyValueStore for dedup
+        String storeName = "dedup-store";
+        builder.addStateStore(
+                Stores.keyValueStoreBuilder(
+                        Stores.persistentKeyValueStore(storeName),
+                        Serdes.String(),
+                        Serdes.String()
+                ).withLoggingEnabled(new HashMap<>()) // enable changelog
+        );
 
         for (String inputTopic : mapper.getAllInputTopics()) {
             DedupTopicMapper.TopicMapping mapping = mapper.getMapping(inputTopic);
-            String dedupTopic = mapping.dedupTopic;
             String outputTopic = mapping.outputTopic;
 
-            log.info("=== Processing input topic: {} ===", inputTopic);
-
-            // Create partition-local KTable for deduplication
-            KTable<String, String> dedupTable = builder.table(
-                dedupTopic,
-                Consumed.with(Serdes.String(), Serdes.String()),
-                Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as(dedupTopic)
-                    .withKeySerde(Serdes.String())
-                    .withValueSerde(Serdes.String())
-                    .withLoggingEnabled(new HashMap<>())
-            );
-            log.info("Dedup KTable created for topic: {}", dedupTopic);
-
-            // Stream from input topic
             KStream<String, String> stream = builder.stream(
-                inputTopic,
-                Consumed.with(Serdes.String(), Serdes.String())
+                    inputTopic,
+                    Consumed.with(Serdes.String(), Serdes.String())
             );
-            log.info("Stream created for input topic: {}", inputTopic);
 
-            // Deduplication logic
-            KStream<String, String> deduped = stream.leftJoin(
-                dedupTable,
-                (value, existingHash) -> {
-                    String newHash = computeHash(value);
-                    if (existingHash == null) {
-                        log.info("NEW RECORD key={} hash={}", value, newHash);
-                    } else if (!existingHash.equals(newHash)) {
-                        log.info("UPDATED RECORD key={} oldHash={} newHash={}", value, existingHash, newHash);
-                    } else {
-                        log.info("DUPLICATE RECORD key={} hash={}", value, newHash);
-                    }
-
-                    return (existingHash == null || !existingHash.equals(newHash)) ? value : null;
-                }
-            ).filter((k, v) -> v != null);
+            // Apply stateful transformer for synchronous dedup
+            KStream<String, String> deduped = stream.transformValues(
+                    () -> new DedupTransformer(storeName),
+                    storeName
+            ).filter((k, v) -> v != null); // drop duplicates
 
             // Publish deduplicated records to output topic
             deduped.to(outputTopic, Produced.with(Serdes.String(), Serdes.String()));
-            log.info("Deduped records published to output topic: {}", outputTopic);
-
-            // Update dedup hash topic
-            deduped.mapValues(DedupStreamsApplication::computeHash)
-                   .to(dedupTopic, Produced.with(Serdes.String(), Serdes.String()));
-            log.info("Dedup hash updated to topic: {}", dedupTopic);
-
-            lastStream = deduped;
-            log.info("=== Completed processing for input topic: {} ===", inputTopic);
         }
 
-        return lastStream;
+        return null; // bean return is not used
+    }
+
+    // Transformer that performs synchronous deduplication
+    public static class DedupTransformer implements ValueTransformerWithKey<String, String, String> {
+
+        private final String storeName;
+        private KeyValueStore<String, String> kvStore;
+
+        public DedupTransformer(String storeName) {
+            this.storeName = storeName;
+        }
+
+        @Override
+        public void init(ProcessorContext context) {
+            this.kvStore = (KeyValueStore<String, String>) context.getStateStore(storeName);
+        }
+
+        @Override
+        public String transform(String key, String value) {
+            if (value == null) return null;
+
+            String newHash = computeHash(value);
+            String oldHash = kvStore.get(key);
+
+            if (oldHash == null) {
+                kvStore.put(key, newHash);
+                System.out.println("Accepting new document '" + key + "'");
+                return value;
+            }
+
+            if (oldHash.equals(newHash)) {
+                System.out.println("Rejecting unchanged document '" + key + "'");
+                return null; // duplicate
+            } else {
+                kvStore.put(key, newHash);
+                System.out.println("Accepting updated document '" + key + "'");
+                return value;
+            }
+        }
+
+        @Override
+        public void close() {}
     }
 
     private static String computeHash(String json) {
@@ -123,7 +137,6 @@ public class DedupStreamsApplication {
             byte[] hash = digest.digest(json.getBytes(StandardCharsets.UTF_8));
             return Base64.getEncoder().encodeToString(hash);
         } catch (Exception e) {
-            log.error("Error computing hash", e);
             return "";
         }
     }
