@@ -19,7 +19,7 @@ if (oldHash == null || !MessageDigest.isEqual(oldHash, newHash)) {
     store.put(key, newHash);
     return value; // pass through
 } else {
-    return null; // drop duplicate
+    return null; // drop duplicatez
 }
 ```
 
