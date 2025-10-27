@@ -5,7 +5,6 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.utils.Bytes;
-import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.*;
 import org.apache.kafka.streams.kstream.*;
 import org.apache.kafka.streams.processor.*;
@@ -45,10 +44,8 @@ public class DedupStreamsApplication {
         props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
         props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 500L);
         props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 0);
-        // recommend earliest for dev/test when you want to pick up prior records if no committed offsets
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
 
-        // state dir: include app id so different apps don't collide; can be overridden by env/config
         String tmpDir = System.getProperty("java.io.tmpdir");
         String stateDir = tmpDir.endsWith("/") ? tmpDir + "kafka-streams-dedup" : tmpDir + "/kafka-streams-dedup";
         props.put(StreamsConfig.STATE_DIR_CONFIG, stateDir);
@@ -67,7 +64,6 @@ public class DedupStreamsApplication {
             String outputTopic = mapping.outputTopic;
 
             String rawStoreName = "global-" + outputTopic;
-            // normalize store name (avoid characters that may confuse store naming)
             String globalStoreName = rawStoreName.replaceAll("[^A-Za-z0-9_\\-]", "_");
 
             log.info("Wiring mapping: inputTopic={} outputTopic={} globalStore={}", inputTopic, outputTopic, globalStoreName);
@@ -86,7 +82,6 @@ public class DedupStreamsApplication {
                     Consumed.with(Serdes.String(), Serdes.String())
             );
 
-            // Transformer with cache + global store lookup
             KStream<String, String> deduped = input.transformValues(
                     () -> new DedupTransformerWithCache(globalStoreName),
                     Named.as("dedup-" + globalStoreName)
@@ -103,20 +98,18 @@ public class DedupStreamsApplication {
         private static final Logger logger = LoggerFactory.getLogger(DedupTransformerWithCache.class);
 
         private final String globalStoreName;
-        private ReadOnlyKeyValueStore<String, String> globalStore;
+        private ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>> globalStore;
         private ProcessorContext context;
         private Cache<String, String> localCache;
 
-        // cache configs - tune as needed
         private final long cacheTtlSeconds = 10;
-        private final long cachePrintIntervalSeconds = 30; // show cache size/metrics periodically
+        private final long cachePrintIntervalSeconds = 30;
 
         public DedupTransformerWithCache(String globalStoreName) {
             this.globalStoreName = globalStoreName;
         }
 
         @Override
-        @SuppressWarnings("unchecked")
         public void init(ProcessorContext context) {
             this.context = context;
             this.localCache = Caffeine.newBuilder()
@@ -124,107 +117,83 @@ public class DedupStreamsApplication {
                     .maximumSize(100_000)
                     .build();
 
-            logger.info("DedupTransformerWithCache.init() called for store='{}' - starting retry to obtain store", globalStoreName);
+            logger.info("Initializing DedupTransformerWithCache for store='{}'", globalStoreName);
 
-            // Try to get the store immediately; if not available, schedule repeated tries.
             try {
-                StateStore s = context.getStateStore(globalStoreName);
-                if (s != null && s instanceof ReadOnlyKeyValueStore) {
-                    this.globalStore = (ReadOnlyKeyValueStore<String, String>) s;
-                    logger.info("Global store '{}' obtained synchronously at init()", globalStoreName);
-                } else {
-                    logger.info("Global store '{}' not available at init(); scheduling retry", globalStoreName);
+                ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>> store =
+                        (ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>>) context.getStateStore(globalStoreName);
+                if (store != null) {
+                    this.globalStore = store;
+                    logger.info("Global store '{}' obtained at init()", globalStoreName);
                 }
             } catch (Exception e) {
-                logger.warn("Exception while trying to get state store at init(): {}", e.getMessage());
+                logger.warn("Global store '{}' not available yet at init(): {}", globalStoreName, e.getMessage());
             }
 
-            // schedule a periodic task to try to acquire the store and to log cache size
-            context.schedule(Duration.ofSeconds(2), PunctuationType.WALL_CLOCK_TIME, timestamp -> {
+            context.schedule(Duration.ofSeconds(3), PunctuationType.WALL_CLOCK_TIME, timestamp -> {
                 if (globalStore == null) {
                     try {
-                        StateStore s = context.getStateStore(globalStoreName);
-                        if (s != null && s instanceof ReadOnlyKeyValueStore) {
-                            this.globalStore = (ReadOnlyKeyValueStore<String, String>) s;
-                            logger.info("Global store '{}' is now available (scheduled retry).", globalStoreName);
+                        ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>> store =
+                                (ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>>) context.getStateStore(globalStoreName);
+                        if (store != null) {
+                            this.globalStore = store;
+                            logger.info("Global store '{}' became available at runtime.", globalStoreName);
                         }
-                    } catch (Exception ex) {
-                        // ignore; next punctuation will retry
-                    }
+                    } catch (Exception ignored) {}
                 }
-                // periodic cache metric/log
+
                 try {
-                    long size = localCache.estimatedSize();
-                    logger.debug("Cache (store={}) estimated size = {}", globalStoreName, size);
-                } catch (Exception ex) {
-                    // ignore
-                }
+                    long cacheSize = localCache.estimatedSize();
+                    logger.debug("Cache (store={}) estimated size = {}", globalStoreName, cacheSize);
+                } catch (Exception ignored) {}
             });
         }
 
         @Override
         public String transform(String key, String value) {
             if (key == null || value == null) {
-                logger.debug("Skipping null key/value (key={}, value==null?)", key);
+                logger.debug("Skipping null key/value for key={}", key);
                 return null;
             }
 
-            final String newHash = computeHash(value);
+            String newHash = computeHash(value);
 
-            // 1) Fast local cache check
-            try {
-                String cached = localCache.getIfPresent(key);
-                if (cached != null) {
-                    if (cached.equals(newHash)) {
-                        logger.info("[CACHE HIT] key='{}' duplicate detected in local cache", key);
-                        return null;
-                    } else {
-                        logger.debug("[CACHE STALE] key='{}' cachedHash!=newHash (cached={}, new={})", key, cached, newHash);
-                    }
-                } else {
-                    logger.debug("[CACHE MISS] key='{}'", key);
-                }
-            } catch (Exception ex) {
-                logger.warn("Error reading local cache for key='{}': {}", key, ex.getMessage());
+            // 1️⃣ Check in-memory cache
+            String cached = localCache.getIfPresent(key);
+            if (cached != null && cached.equals(newHash)) {
+                logger.info("[CACHE HIT] Duplicate detected in cache for key={}", key);
+                return null;
             }
 
-            // 2) Global store check (authoritative; may be null until restored)
-            if (globalStore == null) {
-                logger.debug("[GLOBAL CHECK SKIPPED] global store '{}' not yet available for key='{}'", globalStoreName, key);
-            } else {
+            // 2️⃣ Check global store
+            if (globalStore != null) {
                 try {
-                    String stored = globalStore.get(key);
-                    if (stored != null) {
-                        String storedHash = stored; // assuming stored value is already the hash or the JSON — adapt if you store JSON
-                        // If stored value is JSON and you store hash in store, compare hashes accordingly.
-                        // Here we assume value stored in global table is the same JSON and we compute hash for comparison.
-                        String storedHashComputed = computeHash(stored);
-                        if (storedHashComputed.equals(newHash)) {
-                            logger.info("[GLOBAL HIT] key='{}' duplicate detected in global store", key);
-                            // also insert into local cache (so subsequent duplicates are caught quickly)
+                    ValueAndTimestamp<String> storedRecord = globalStore.get(key);
+                    if (storedRecord != null) {
+                        String storedValue = storedRecord.value();
+                        String storedHash = computeHash(storedValue);
+                        if (storedHash.equals(newHash)) {
+                            logger.info("[GLOBAL HIT] Duplicate detected in GlobalKTable for key={}", key);
                             localCache.put(key, newHash);
                             return null;
-                        } else {
-                            logger.debug("[GLOBAL MISS] key='{}' stored hash != new hash", key);
                         }
-                    } else {
-                        logger.debug("[GLOBAL MISS] key='{}' not present in global store", key);
                     }
-                } catch (Exception ex) {
-                    logger.warn("Error reading global store '{}' for key='{}': {}", globalStoreName, key, ex.getMessage());
+                } catch (Exception e) {
+                    logger.warn("Error reading global store '{}' for key={}: {}", globalStoreName, key, e.getMessage());
                 }
+            } else {
+                logger.debug("[GLOBAL CHECK SKIPPED] Global store '{}' not ready for key={}", globalStoreName, key);
             }
 
-            // 3) Accept and cache
+            // 3️⃣ Accept and cache
             localCache.put(key, newHash);
-            logger.info("[ACCEPT] key='{}' accepted and cached (hash={})", key, newHash);
+            logger.info("[ACCEPT] key={} accepted and cached (hash={})", key, newHash);
             return value;
         }
 
         @Override
         public void close() {
-            // nothing to close; cache will be GC'd on shutdown
-            logger.info("DedupTransformerWithCache.close() called for store='{}'", globalStoreName);
+            logger.info("Closing DedupTransformerWithCache for store='{}'", globalStoreName);
         }
     }
 
