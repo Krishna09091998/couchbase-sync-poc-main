@@ -1,6 +1,5 @@
 package com.path.stream.app;
 
-import com.example.DedupTopicMapper;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import org.apache.kafka.common.serialization.Serdes;
@@ -21,6 +20,7 @@ import java.security.MessageDigest;
 import java.util.*;
 import java.util.Base64;
 import java.util.concurrent.TimeUnit;
+import java.time.Duration;
 
 @SpringBootApplication
 @EnableKafkaStreams
@@ -39,6 +39,9 @@ public class DedupStreamsApplication {
         props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
         props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 500L);
         props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 0);
+        String tmpDir = System.getProperty("java.io.tmpdir");
+        String podName = System.getenv("POD_NAME");
+        String stateDir = tmpDir + "kafka-streams/dedup-streams-app/01";
         props.put(StreamsConfig.STATE_DIR_CONFIG, "/tmp/kafka-streams-dedup");
         return new KafkaStreamsConfiguration(props);
     }
@@ -113,24 +116,18 @@ public class DedupStreamsApplication {
             if (key == null || value == null) return null;
 
             String hash = computeHash(value);
-
-            // 1️⃣ Check in-memory cache
             String cached = localCache.getIfPresent(key);
             if (hash.equals(cached)) {
-                System.out.println("⏩ Dropped duplicate from in-memory cache: " + key);
+                System.out.println(" Dropped duplicate from in-memory cache: " + key);
                 return null;
             }
-
-            // 2️⃣ Check GlobalKTable (if available)
             if (globalStore != null) {
                 String stored = globalStore.get(key);
                 if (hash.equals(stored)) {
-                    System.out.println("🧩 Dropped duplicate from GlobalKTable: " + key);
+                    System.out.println("Dropped duplicate from GlobalKTable: " + key);
                     return null;
                 }
             }
-
-            // 3️⃣ Accept and cache
             localCache.put(key, hash);
             return value;
         }
