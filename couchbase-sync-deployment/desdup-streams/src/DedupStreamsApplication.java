@@ -110,44 +110,49 @@ public class DedupStreamsApplication {
         }
 
         @Override
-        public void init(ProcessorContext context) {
-            this.context = context;
-            this.localCache = Caffeine.newBuilder()
-                    .expireAfterWrite(cacheTtlSeconds, TimeUnit.SECONDS)
-                    .maximumSize(100_000)
-                    .build();
+        @Override
+public void init(ProcessorContext context) {
+    this.context = context;
+    this.localCache = Caffeine.newBuilder()
+            .recordStats()
+            .expireAfterWrite(cacheTtlSeconds, TimeUnit.SECONDS)
+            .maximumSize(100_000)
+            .build();
 
-            logger.info("Initializing DedupTransformerWithCache for store='{}'", globalStoreName);
+    logger.info("🧠 Created new local cache for globalStore='{}' with TTL={}s and maxSize={}", 
+            globalStoreName, cacheTtlSeconds, 100_000);
 
+    try {
+        ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>> store =
+                (ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>>) context.getStateStore(globalStoreName);
+        if (store != null) {
+            this.globalStore = store;
+            logger.info("Global store '{}' obtained at init()", globalStoreName);
+        }
+    } catch (Exception e) {
+        logger.warn("Global store '{}' not available yet at init(): {}", globalStoreName, e.getMessage());
+    }
+
+    context.schedule(Duration.ofSeconds(3), PunctuationType.WALL_CLOCK_TIME, timestamp -> {
+        if (globalStore == null) {
             try {
                 ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>> store =
                         (ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>>) context.getStateStore(globalStoreName);
                 if (store != null) {
                     this.globalStore = store;
-                    logger.info("Global store '{}' obtained at init()", globalStoreName);
+                    logger.info("Global store '{}' became available at runtime.", globalStoreName);
                 }
-            } catch (Exception e) {
-                logger.warn("Global store '{}' not available yet at init(): {}", globalStoreName, e.getMessage());
-            }
-
-            context.schedule(Duration.ofSeconds(3), PunctuationType.WALL_CLOCK_TIME, timestamp -> {
-                if (globalStore == null) {
-                    try {
-                        ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>> store =
-                                (ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>>) context.getStateStore(globalStoreName);
-                        if (store != null) {
-                            this.globalStore = store;
-                            logger.info("Global store '{}' became available at runtime.", globalStoreName);
-                        }
-                    } catch (Exception ignored) {}
-                }
-
-                try {
-                    long cacheSize = localCache.estimatedSize();
-                    logger.debug("Cache (store={}) estimated size = {}", globalStoreName, cacheSize);
-                } catch (Exception ignored) {}
-            });
+            } catch (Exception ignored) {}
         }
+
+        try {
+            long cacheSize = localCache.estimatedSize();
+            logger.debug("🧾 Cache Stats (store={}): size={} stats={}", 
+                    globalStoreName, cacheSize, localCache.stats());
+        } catch (Exception ignored) {}
+    });
+}
+
 
         @Override
         public String transform(String key, String value) {
