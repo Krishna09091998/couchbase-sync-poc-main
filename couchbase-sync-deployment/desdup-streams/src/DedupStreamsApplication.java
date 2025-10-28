@@ -50,14 +50,19 @@ public class DedupStreamsApplication {
         String stateDir = tmpDir.endsWith("/") ? tmpDir + "kafka-streams-dedup" : tmpDir + "/kafka-streams-dedup";
         props.put(StreamsConfig.STATE_DIR_CONFIG, stateDir);
 
-        log.info("Kafka Streams config: state.dir={}", stateDir);
+        log.info("Kafka Streams configuration initialized");
+        log.info("Application ID: {}", props.get(StreamsConfig.APPLICATION_ID_CONFIG));
+        log.info("Bootstrap Servers: {}", props.get(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG));
+        log.info("State Directory: {}", stateDir);
+
         return new KafkaStreamsConfiguration(props);
     }
 
     @Bean
     public KStream<String, String> buildDedupStream(StreamsBuilder builder) throws Exception {
-
         DedupTopicMapper mapper = new DedupTopicMapper("dedup-mapping.properties");
+
+        log.info("Building deduplication topology from mapping file");
 
         for (String inputTopic : mapper.getAllInputTopics()) {
             DedupTopicMapper.TopicMapping mapping = mapper.getMapping(inputTopic);
@@ -66,9 +71,9 @@ public class DedupStreamsApplication {
             String rawStoreName = "global-" + outputTopic;
             String globalStoreName = rawStoreName.replaceAll("[^A-Za-z0-9_\\-]", "_");
 
-            log.info("Wiring mapping: inputTopic={} outputTopic={} globalStore={}", inputTopic, outputTopic, globalStoreName);
+            log.info("Wiring mapping: inputTopic={} → outputTopic={} → globalStore={}", inputTopic, outputTopic, globalStoreName);
 
-            // GlobalKTable subscribed to output topic (dedup reference)
+            // Global store based on output topic
             builder.globalTable(
                     outputTopic,
                     Consumed.with(Serdes.String(), Serdes.String()),
@@ -77,17 +82,17 @@ public class DedupStreamsApplication {
                             .withValueSerde(Serdes.String())
             );
 
-            KStream<String, String> input = builder.stream(
-                    inputTopic,
-                    Consumed.with(Serdes.String(), Serdes.String())
-            );
+            // Input topic stream
+            KStream<String, String> input = builder.stream(inputTopic, Consumed.with(Serdes.String(), Serdes.String()));
 
-            KStream<String, String> deduped = input.transformValues(
-                    () -> new DedupTransformerWithCache(globalStoreName),
-                    Named.as("dedup-" + globalStoreName)
-            ).filter((k, v) -> v != null);
+            // Deduplication logic
+            KStream<String, String> deduped = input
+                    .transformValues(() -> new DedupTransformerWithCache(globalStoreName), Named.as("dedup-" + globalStoreName))
+                    .filter((k, v) -> v != null);
 
             deduped.to(outputTopic, Produced.with(Serdes.String(), Serdes.String()));
+
+            log.info("Deduplication pipeline created for inputTopic={} and outputTopic={}", inputTopic, outputTopic);
         }
 
         return null;
@@ -96,81 +101,70 @@ public class DedupStreamsApplication {
     public static class DedupTransformerWithCache implements ValueTransformerWithKey<String, String, String> {
 
         private static final Logger logger = LoggerFactory.getLogger(DedupTransformerWithCache.class);
-
         private final String globalStoreName;
         private ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>> globalStore;
         private ProcessorContext context;
         private Cache<String, String> localCache;
 
         private final long cacheTtlSeconds = 10;
-        private final long cachePrintIntervalSeconds = 30;
 
         public DedupTransformerWithCache(String globalStoreName) {
             this.globalStoreName = globalStoreName;
         }
 
         @Override
-        @Override
-public void init(ProcessorContext context) {
-    this.context = context;
-    this.localCache = Caffeine.newBuilder()
-            .recordStats()
-            .expireAfterWrite(cacheTtlSeconds, TimeUnit.SECONDS)
-            .maximumSize(100_000)
-            .build();
+        public void init(ProcessorContext context) {
+            this.context = context;
+            this.localCache = Caffeine.newBuilder()
+                    .expireAfterWrite(cacheTtlSeconds, TimeUnit.SECONDS)
+                    .maximumSize(100_000)
+                    .build();
 
-    logger.info("🧠 Created new local cache for globalStore='{}' with TTL={}s and maxSize={}", 
-            globalStoreName, cacheTtlSeconds, 100_000);
+            logger.info("Initializing DedupTransformerWithCache for store='{}'", globalStoreName);
 
-    try {
-        ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>> store =
-                (ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>>) context.getStateStore(globalStoreName);
-        if (store != null) {
-            this.globalStore = store;
-            logger.info("Global store '{}' obtained at init()", globalStoreName);
-        }
-    } catch (Exception e) {
-        logger.warn("Global store '{}' not available yet at init(): {}", globalStoreName, e.getMessage());
-    }
-
-    context.schedule(Duration.ofSeconds(3), PunctuationType.WALL_CLOCK_TIME, timestamp -> {
-        if (globalStore == null) {
             try {
-                ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>> store =
-                        (ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>>) context.getStateStore(globalStoreName);
-                if (store != null) {
-                    this.globalStore = store;
-                    logger.info("Global store '{}' became available at runtime.", globalStoreName);
+                this.globalStore = (ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>>) context.getStateStore(globalStoreName);
+                if (globalStore != null) {
+                    logger.info("Global store '{}' successfully loaded during init()", globalStoreName);
                 }
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                logger.warn("Global store '{}' not available yet: {}", globalStoreName, e.getMessage());
+            }
+
+            context.schedule(Duration.ofSeconds(3), PunctuationType.WALL_CLOCK_TIME, timestamp -> {
+                if (globalStore == null) {
+                    try {
+                        this.globalStore = (ReadOnlyKeyValueStore<String, ValueAndTimestamp<String>>) context.getStateStore(globalStoreName);
+                        if (globalStore != null) {
+                            logger.info("Global store '{}' became available at runtime.", globalStoreName);
+                        }
+                    } catch (Exception ignored) {}
+                }
+                try {
+                    logger.debug("Cache monitor: store={} size={} estimatedTTL={}s", globalStoreName, localCache.estimatedSize(), cacheTtlSeconds);
+                } catch (Exception ignored) {}
+            });
         }
-
-        try {
-            long cacheSize = localCache.estimatedSize();
-            logger.debug("🧾 Cache Stats (store={}): size={} stats={}", 
-                    globalStoreName, cacheSize, localCache.stats());
-        } catch (Exception ignored) {}
-    });
-}
-
 
         @Override
         public String transform(String key, String value) {
             if (key == null || value == null) {
-                logger.debug("Skipping null key/value for key={}", key);
+                logger.debug("Skipping null key/value record key={}", key);
                 return null;
             }
 
             String newHash = computeHash(value);
 
-            // 1️⃣ Check in-memory cache
+            logger.debug("Processing record key={} with hash={}", key, newHash);
+
+            // Step 1: Check in-memory cache
             String cached = localCache.getIfPresent(key);
             if (cached != null && cached.equals(newHash)) {
-                logger.info("[CACHE HIT] Duplicate detected in cache for key={}", key);
+                logger.info("[CACHE HIT] Duplicate detected for key={} (hash={})", key, newHash);
                 return null;
             }
 
-            // 2️⃣ Check global store
+            // Step 2: Check global store
             if (globalStore != null) {
                 try {
                     ValueAndTimestamp<String> storedRecord = globalStore.get(key);
@@ -178,21 +172,23 @@ public void init(ProcessorContext context) {
                         String storedValue = storedRecord.value();
                         String storedHash = computeHash(storedValue);
                         if (storedHash.equals(newHash)) {
-                            logger.info("[GLOBAL HIT] Duplicate detected in GlobalKTable for key={}", key);
+                            logger.info("[GLOBAL HIT] Duplicate detected in GlobalKTable for key={} (hash={})", key, newHash);
                             localCache.put(key, newHash);
                             return null;
                         }
+                    } else {
+                        logger.debug("Global store lookup: key={} not found", key);
                     }
                 } catch (Exception e) {
-                    logger.warn("Error reading global store '{}' for key={}: {}", globalStoreName, key, e.getMessage());
+                    logger.error("Error reading global store '{}' for key={}: {}", globalStoreName, key, e.getMessage());
                 }
             } else {
-                logger.debug("[GLOBAL CHECK SKIPPED] Global store '{}' not ready for key={}", globalStoreName, key);
+                logger.warn("[GLOBAL CHECK SKIPPED] Global store '{}' not ready for key={}", globalStoreName, key);
             }
 
-            // 3️⃣ Accept and cache
+            // Step 3: Accept new record
             localCache.put(key, newHash);
-            logger.info("[ACCEPT] key={} accepted and cached (hash={})", key, newHash);
+            logger.info("[ACCEPT] New record accepted for key={} and cached (hash={})", key, newHash);
             return value;
         }
 
@@ -209,6 +205,7 @@ public void init(ProcessorContext context) {
             byte[] hash = digest.digest(json.getBytes(StandardCharsets.UTF_8));
             return Base64.getEncoder().encodeToString(hash);
         } catch (Exception e) {
+            log.error("Error computing hash: {}", e.getMessage());
             return "";
         }
     }
