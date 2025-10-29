@@ -1,68 +1,85 @@
-const { Kafka } = require('kafkajs');
+// burstTestProducer.js
+import { Kafka } from "kafkajs";
 
-// ✅ Kafka configuration
 const kafka = new Kafka({
-  clientId: 'burst-producer',
-  brokers: ['localhost:9092']
+  clientId: "burst-test-producer",
+  brokers: ["localhost:9092"],
 });
 
 const producer = kafka.producer();
 
-// ✅ 5 input topics
-const inputTopics = [
-  'input-topic-1',
-  'input-topic-2',
-  'input-topic-3',
-  'input-topic-4',
-  'input-topic-5'
+const topics = [
+  "input-topic-1",
+  "input-topic-2",
+  "input-topic-3",
+  "input-topic-4",
+  "input-topic-5",
 ];
 
-// Generate random JSON record
-function generateRecord(topic, i) {
+// Create one JSON record
+function createRecord(id, topic) {
   return {
-    topic,
-    key: `key-${Math.floor(Math.random() * 10)}`, // random key (0–9)
+    key: `key-${id % 50}`, // reuse some keys to test dedup collisions
     value: JSON.stringify({
-      id: i,
-      message: `Test message ${i}`,
-      timestamp: new Date().toISOString()
-    })
+      id,
+      message: `Message ${id} for ${topic}`,
+      timestamp: new Date().toISOString(),
+    }),
   };
 }
 
-// Produce messages in burst mode
-async function burstMessages() {
-  let counter = 0;
+async function sendRecords(topic, withGap = false) {
+  console.log(
+    `\n🚀 Starting test for ${topic} | Gap: ${withGap ? "10s" : "none"}`
+  );
 
-  for (const topic of inputTopics) {
-    const messages = [];
+  // 1️⃣ Send 1000 unique messages
+  const uniqueMessages = Array.from({ length: 1000 }, (_, i) =>
+    createRecord(i, topic)
+  );
 
-    // create 100 messages per topic per burst
-    for (let i = 0; i < 100; i++) {
-      messages.push({
-        key: `key-${i % 10}`,
-        value: JSON.stringify(generateRecord(topic, counter++))
-      });
-    }
+  await producer.send({
+    topic,
+    messages: uniqueMessages,
+  });
 
-    console.log(`🚀 Producing ${messages.length} messages to ${topic}`);
-    await producer.send({ topic, messages });
+  console.log(`✅ Sent 1000 unique messages to ${topic}`);
+
+  // Optional 10s gap before duplicates
+  if (withGap) {
+    console.log("⏳ Waiting 10 seconds before sending duplicates...");
+    await new Promise((r) => setTimeout(r, 10_000));
   }
+
+  // 2️⃣ Send duplicates
+  await producer.send({
+    topic,
+    messages: uniqueMessages,
+  });
+
+  console.log(
+    `♻️ Sent 1000 duplicate messages to ${topic} ${withGap ? "(after delay)" : "(immediately)"}`
+  );
 }
 
-async function main() {
+async function runTests() {
   await producer.connect();
 
-  console.log('🔥 Burst producer started! Producing to 5 topics every 10 seconds...');
+  // SCENARIO 1: No gap (cache dedup)
+  for (const topic of topics) {
+    await sendRecords(topic, false);
+  }
 
-  // run burst every 10 seconds
-  setInterval(async () => {
-    try {
-      await burstMessages();
-    } catch (err) {
-      console.error('❌ Error producing messages:', err);
-    }
-  }, 10_000);
+  // SCENARIO 2: 10s gap (global dedup)
+  for (const topic of topics) {
+    await sendRecords(topic, true);
+  }
+
+  await producer.disconnect();
+  console.log("\n🏁 All scenarios completed!");
 }
 
-main().catch(console.error);
+runTests().catch((err) => {
+  console.error("❌ Error producing messages:", err);
+  process.exit(1);
+});
