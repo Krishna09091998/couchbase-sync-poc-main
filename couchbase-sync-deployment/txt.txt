@@ -1,78 +1,43 @@
-// burstTestProducer.js
+// burstInterleavedProducer.js
 import { Kafka } from "kafkajs";
 
-const kafka = new Kafka({
-  clientId: "burst-test-producer",
-  brokers: ["localhost:9092"],
-});
-
+const kafka = new Kafka({ clientId: "burst-test-producer", brokers: ["localhost:9092"] });
 const producer = kafka.producer();
 
-// Define input topics
 const topics = [
-  "input-topic-1",
-  "input-topic-2",
-  "input-topic-3",
-  "input-topic-4",
-  "input-topic-5",
+  "input-topic-1","input-topic-2","input-topic-3","input-topic-4","input-topic-5"
 ];
 
-// Create one JSON record
 function createRecord(id, topic) {
   return {
-    key: `key-${id % 50}`, // simulate same keys for dedup collisions
-    value: JSON.stringify({
-      id,
-      message: `Message ${id} for ${topic}`,
-      timestamp: new Date().toISOString(),
-    }),
+    key: `key-${id % 50}`, // reuse keys to exercise dedup collisions
+    value: JSON.stringify({ id, message: `Message ${id} for ${topic}`, timestamp: new Date().toISOString() })
   };
 }
 
-async function sendRecords(topic, withGap = false) {
-  console.log(
-    `\n🚀 Starting test for ${topic} | Gap: ${withGap ? "10s" : "none"}`
-  );
+const tinySleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // 1️⃣ Send 1000 unique messages
-  const uniqueMessages = Array.from({ length: 1000 }, (_, i) =>
-    createRecord(i, topic)
-  );
-
-  await producer.send({ topic, messages: uniqueMessages });
-  console.log(`✅ Sent 1000 unique messages to ${topic}`);
-
-  // Optional delay before sending duplicates
-  if (withGap) {
-    console.log("⏳ Waiting 10 seconds before sending duplicates...");
-    await new Promise((r) => setTimeout(r, 10_000));
+async function sendInterleaved(topic) {
+  console.log(`\n🚀 Interleaved test for ${topic}`);
+  for (let i = 0; i < 1000; i++) {
+    // send original
+    await producer.send({ topic, messages: [createRecord(i, topic)] });
+    // tiny pause to give Streams a chance to process the original (tune 0-10ms)
+    await tinySleep(2);
+    // send duplicate
+    await producer.send({ topic, messages: [createRecord(i, topic)] });
+    if ((i + 1) % 100 === 0) console.log(`  sent ${i + 1} pairs`);
   }
-
-  // 2️⃣ Send duplicates
-  await producer.send({ topic, messages: uniqueMessages });
-  console.log(
-    `♻️ Sent 1000 duplicate messages to ${topic} ${withGap ? "(after delay)" : "(immediately)"}`
-  );
+  console.log(`✅ Done interleaved for ${topic}`);
 }
 
-async function runTests() {
+async function run() {
   await producer.connect();
-
-  // SCENARIO 1: No gap (cache-level dedup)
-  for (const topic of topics) {
-    await sendRecords(topic, false);
-  }
-
-  // SCENARIO 2: 10s gap (GlobalKTable-level dedup)
-  for (const topic of topics) {
-    await sendRecords(topic, true);
-  }
-
+  for (const t of topics) await sendInterleaved(t);
   await producer.disconnect();
-  console.log("\n🏁 All scenarios completed!");
+  console.log("🏁 All interleaved tests done");
 }
 
-runTests().catch((err) => {
-  console.error("❌ Error producing messages:", err);
-  process.exit(1);
-});
+run().catch(e => { console.error(e); process.exit(1); });
+
+
