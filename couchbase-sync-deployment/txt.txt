@@ -8,6 +8,7 @@ const kafka = new Kafka({
 
 const producer = kafka.producer();
 
+// Define input topics
 const topics = [
   "input-topic-1",
   "input-topic-2",
@@ -19,7 +20,7 @@ const topics = [
 // Create one JSON record
 function createRecord(id, topic) {
   return {
-    key: `key-${id % 50}`, // reuse some keys to test dedup collisions
+    key: `key-${id % 50}`, // simulate same keys for dedup collisions
     value: JSON.stringify({
       id,
       message: `Message ${id} for ${topic}`,
@@ -38,25 +39,17 @@ async function sendRecords(topic, withGap = false) {
     createRecord(i, topic)
   );
 
-  await producer.send({
-    topic,
-    messages: uniqueMessages,
-  });
-
+  await producer.send({ topic, messages: uniqueMessages });
   console.log(`✅ Sent 1000 unique messages to ${topic}`);
 
-  // Optional 10s gap before duplicates
+  // Optional delay before sending duplicates
   if (withGap) {
     console.log("⏳ Waiting 10 seconds before sending duplicates...");
     await new Promise((r) => setTimeout(r, 10_000));
   }
 
   // 2️⃣ Send duplicates
-  await producer.send({
-    topic,
-    messages: uniqueMessages,
-  });
-
+  await producer.send({ topic, messages: uniqueMessages });
   console.log(
     `♻️ Sent 1000 duplicate messages to ${topic} ${withGap ? "(after delay)" : "(immediately)"}`
   );
@@ -65,12 +58,12 @@ async function sendRecords(topic, withGap = false) {
 async function runTests() {
   await producer.connect();
 
-  // SCENARIO 1: No gap (cache dedup)
+  // SCENARIO 1: No gap (cache-level dedup)
   for (const topic of topics) {
     await sendRecords(topic, false);
   }
 
-  // SCENARIO 2: 10s gap (global dedup)
+  // SCENARIO 2: 10s gap (GlobalKTable-level dedup)
   for (const topic of topics) {
     await sendRecords(topic, true);
   }
