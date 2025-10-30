@@ -1,43 +1,59 @@
-// burstInterleavedProducer.js
-import { Kafka } from "kafkajs";
+/*This function will Change the status to amendment-inprogress and check subsequent requests to restrict/return error messages if the record is in amendment-inprogress*/
 
-const kafka = new Kafka({ clientId: "burst-test-producer", brokers: ["localhost:9092"] });
-const producer = kafka.producer();
-
-const topics = [
-  "input-topic-1","input-topic-2","input-topic-3","input-topic-4","input-topic-5"
-];
-
-function createRecord(id, topic) {
-  return {
-    key: `key-${id % 50}`, // reuse keys to exercise dedup collisions
-    value: JSON.stringify({ id, message: `Message ${id} for ${topic}`, timestamp: new Date().toISOString() })
-  };
+exports = async (pathEncounterId, firstName, middleName, lastName, teammateID, credentials, identityType) => {
+    const client = context.services.get("##mongoname##");
+    const db = client.db("##DB##");
+    const { v4: uuidv4 } = require('uuid');
+    const amendmentStatusList = ["in-amendment", "amendment-submitted", "amendment-received"];
+    const session = client.startSession();
+    const currentDate = new Date();
+    let isTransactionStarted = false;
+    try {
+        const patientTxData = await db.collection("PatientTreatment").findOne({ pathEncounterId: pathEncounterId });
+        if (amendmentStatusList.includes(patientTxData.amendmentStatus)) {
+            return JSON.stringify({
+                errorCode: "AmendmentInprogress",
+                errorMessage: "Amendment of this treatment is in progress.",
+                pathEncounterId: pathEncounterId
+            });
+        }
+        const statusHistoryUpdate = {
+            statusHistory: {
+                status: "in-amendment",
+                id: uuidv4().toUpperCase(),
+                assigned: currentDate
+            }
+        };
+        const amendmentOwnerData = {
+            amendmentOwner: {
+                id: uuidv4().toUpperCase(),
+                firstName: firstName,
+                middleName: middleName,
+                lastName: lastName,
+                teammateID: teammateID,
+                credentials: credentials,
+                identityType: identityType,
+                treatmentStart: currentDate,
+                treatmentEnd: null
+            }
+        };
+        session.startTransaction();
+        isTransactionStarted = true;
+        await db.collection("PATH_Encounter").updateOne({ id: patientTxData.pathEncounterId }, { $set: { status: "in-amendment" }, $push: statusHistoryUpdate }, { session });
+        await db.collection("PatientTreatment").updateOne({ pathEncounterId: pathEncounterId }, { $set: { amendmentStatus: "in-amendment" }, $push: teammateID ? amendmentOwnerData : {} }, { session: session });
+        await session.commitTransaction();
+        console.log(`COMMITED Sessions sucessfully for pathEncounterId ${pathEncounterId}`);
+        return JSON.stringify({ status: "success", message: "Started Amendment successfully" })
+    } catch (error) {
+        console.log(`Error While processing for pathEncounterId ${pathEncounterId}, ${error}`);
+        isTransactionStarted && await session.abortTransaction();
+        console.log(`ABORTED Session for pathEncounterId ${pathEncounterId}`);
+        return JSON.stringify({
+            errorCode: "AmendmentStatusUpdateFailed",
+            errorMessage: "Error occurred while changing the amendment status for treatment",
+            pathEncounterId: pathEncounterId
+        });
+    } finally {
+        session.endSession();
+    }
 }
-
-const tinySleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-async function sendInterleaved(topic) {
-  console.log(`\n🚀 Interleaved test for ${topic}`);
-  for (let i = 0; i < 1000; i++) {
-    // send original
-    await producer.send({ topic, messages: [createRecord(i, topic)] });
-    // tiny pause to give Streams a chance to process the original (tune 0-10ms)
-    await tinySleep(2);
-    // send duplicate
-    await producer.send({ topic, messages: [createRecord(i, topic)] });
-    if ((i + 1) % 100 === 0) console.log(`  sent ${i + 1} pairs`);
-  }
-  console.log(`✅ Done interleaved for ${topic}`);
-}
-
-async function run() {
-  await producer.connect();
-  for (const t of topics) await sendInterleaved(t);
-  await producer.disconnect();
-  console.log("🏁 All interleaved tests done");
-}
-
-run().catch(e => { console.error(e); process.exit(1); });
-
-
