@@ -1,59 +1,219 @@
-/*This function will Change the status to amendment-inprogress and check subsequent requests to restrict/return error messages if the record is in amendment-inprogress*/
+/**
+ * Google Cloud Function (HTTP) to start amendment using Couchbase with transactions.
+ *
+ * Expects JSON body (or query params) containing:
+ *   pathEncounterId, firstName, middleName, lastName, teammateID, credentials, identityType
+ *
+ * Environment variables required:
+ *   COUCHBASE_CONNSTR, COUCHBASE_USER, COUCHBASE_PASS, COUCHBASE_BUCKET,
+ *   COUCHBASE_SCOPE (optional, defaults to "_default"),
+ *   PATH_COLLECTION, PT_COLLECTION
+ *
+ * Assumptions are documented in the message above.
+ */
 
-exports = async (pathEncounterId, firstName, middleName, lastName, teammateID, credentials, identityType) => {
-    const client = context.services.get("##mongoname##");
-    const db = client.db("##DB##");
-    const { v4: uuidv4 } = require('uuid');
-    const amendmentStatusList = ["in-amendment", "amendment-submitted", "amendment-received"];
-    const session = client.startSession();
-    const currentDate = new Date();
-    let isTransactionStarted = false;
-    try {
-        const patientTxData = await db.collection("PatientTreatment").findOne({ pathEncounterId: pathEncounterId });
-        if (amendmentStatusList.includes(patientTxData.amendmentStatus)) {
-            return JSON.stringify({
-                errorCode: "AmendmentInprogress",
-                errorMessage: "Amendment of this treatment is in progress.",
-                pathEncounterId: pathEncounterId
-            });
-        }
-        const statusHistoryUpdate = {
-            statusHistory: {
-                status: "in-amendment",
-                id: uuidv4().toUpperCase(),
-                assigned: currentDate
-            }
-        };
-        const amendmentOwnerData = {
-            amendmentOwner: {
-                id: uuidv4().toUpperCase(),
-                firstName: firstName,
-                middleName: middleName,
-                lastName: lastName,
-                teammateID: teammateID,
-                credentials: credentials,
-                identityType: identityType,
-                treatmentStart: currentDate,
-                treatmentEnd: null
-            }
-        };
-        session.startTransaction();
-        isTransactionStarted = true;
-        await db.collection("PATH_Encounter").updateOne({ id: patientTxData.pathEncounterId }, { $set: { status: "in-amendment" }, $push: statusHistoryUpdate }, { session });
-        await db.collection("PatientTreatment").updateOne({ pathEncounterId: pathEncounterId }, { $set: { amendmentStatus: "in-amendment" }, $push: teammateID ? amendmentOwnerData : {} }, { session: session });
-        await session.commitTransaction();
-        console.log(`COMMITED Sessions sucessfully for pathEncounterId ${pathEncounterId}`);
-        return JSON.stringify({ status: "success", message: "Started Amendment successfully" })
-    } catch (error) {
-        console.log(`Error While processing for pathEncounterId ${pathEncounterId}, ${error}`);
-        isTransactionStarted && await session.abortTransaction();
-        console.log(`ABORTED Session for pathEncounterId ${pathEncounterId}`);
-        return JSON.stringify({
-            errorCode: "AmendmentStatusUpdateFailed",
-            errorMessage: "Error occurred while changing the amendment status for treatment",
-            pathEncounterId: pathEncounterId
-        });
-    } finally {
-        session.endSession();
-    }
+const couchbase = require('couchbase');
+const { v4: uuidv4 } = require('uuid');
+
+const AMENDMENT_STATUS_LIST = ["in-amendment", "amendment-submitted", "amendment-received"];
+
+/** Lazy-initialize Couchbase connections */
+let cluster = null;
+let bucket = null;
+let scope = null;
+let pathCollection = null;
+let ptCollection = null;
+
+/** Initialize Couchbase SDK once per function instance */
+async function initCouchbase() {
+  if (cluster) return;
+
+  const connStr = process.env.COUCHBASE_CONNSTR;
+  const user = process.env.COUCHBASE_USER;
+  const pass = process.env.COUCHBASE_PASS;
+  const bucketName = process.env.COUCHBASE_BUCKET;
+  const scopeName = process.env.COUCHBASE_SCOPE || "_default";
+  const pathCollName = process.env.PATH_COLLECTION || "PATH_Encounter";
+  const ptCollName = process.env.PT_COLLECTION || "PatientTreatment";
+
+  if (!connStr || !user || !pass || !bucketName) {
+    throw new Error("Couchbase connection environment variables missing (COUCHBASE_CONNSTR, COUCHBASE_USER, COUCHBASE_PASS, COUCHBASE_BUCKET).");
+  }
+
+  cluster = await couchbase.connect(connStr, {
+    username: user,
+    password: pass
+  });
+
+  bucket = cluster.bucket(bucketName);
+  scope = bucket.scope(scopeName);
+  pathCollection = scope.collection(pathCollName);
+  ptCollection = scope.collection(ptCollName);
 }
+
+/** Helper: respond JSON */
+function makeResponse(res, statusCode, payload) {
+  res.status(statusCode).set('Content-Type', 'application/json').send(JSON.stringify(payload));
+}
+
+/** The exported Cloud Function */
+exports.startAmendment = async (req, res) => {
+  try {
+    await initCouchbase();
+  } catch (e) {
+    console.error("Couchbase init error:", e);
+    return makeResponse(res, 500, {
+      errorCode: "CouchbaseInitFailed",
+      errorMessage: "Failed to initialize Couchbase connection.",
+      details: e.message
+    });
+  }
+
+  // Accept POST JSON body or query params (per caller preference)
+  const body = (req.method === "POST" && req.body && Object.keys(req.body).length) ? req.body : req.query || {};
+  const {
+    pathEncounterId,
+    firstName,
+    middleName,
+    lastName,
+    teammateID,
+    credentials,
+    identityType
+  } = body;
+
+  if (!pathEncounterId) {
+    return makeResponse(res, 400, {
+      errorCode: "MissingParameter",
+      errorMessage: "pathEncounterId is required"
+    });
+  }
+
+  try {
+    // 1) Look up PatientTreatment document by pathEncounterId using N1QL to get its document key.
+    //    We need the doc key for transactional gets. Adjust the scope/collection qualifiers if required.
+    const bucketName = process.env.COUCHBASE_BUCKET;
+    const scopeName = process.env.COUCHBASE_SCOPE || "_default";
+    const ptCollName = process.env.PT_COLLECTION || "PatientTreatment";
+
+    // Parameterized N1QL: returns meta().id and the document.
+    const query = `
+      SELECT META(pt).id AS __id, pt.*
+      FROM \`${bucketName}\`.\`${scopeName}\`.\`${ptCollName}\` AS pt
+      WHERE pt.pathEncounterId = $1
+      LIMIT 1
+    `;
+    const queryResult = await cluster.query(query, { parameters: [pathEncounterId] });
+
+    if (!queryResult.rows || queryResult.rows.length === 0) {
+      return makeResponse(res, 404, {
+        errorCode: "PatientTreatmentNotFound",
+        errorMessage: `No PatientTreatment found for pathEncounterId ${pathEncounterId}`,
+        pathEncounterId
+      });
+    }
+
+    const ptRow = queryResult.rows[0];
+    const ptDocKey = ptRow.__id;
+    const patientTxData = ptRow; // includes fields from pt.*
+
+    // Check amendment status before starting transaction
+    if (patientTxData.amendmentStatus && AMENDMENT_STATUS_LIST.includes(patientTxData.amendmentStatus)) {
+      return makeResponse(res, 409, { // 409 Conflict
+        errorCode: "AmendmentInprogress",
+        errorMessage: "Amendment of this treatment is in progress.",
+        pathEncounterId
+      });
+    }
+
+    const currentDate = new Date().toISOString();
+    const statusHistoryEntry = {
+      status: "in-amendment",
+      id: uuidv4().toUpperCase(),
+      assigned: currentDate
+    };
+
+    const amendmentOwnerEntry = {
+      id: uuidv4().toUpperCase(),
+      firstName: firstName || null,
+      middleName: middleName || null,
+      lastName: lastName || null,
+      teammateID: teammateID || null,
+      credentials: credentials || null,
+      identityType: identityType || null,
+      treatmentStart: currentDate,
+      treatmentEnd: null
+    };
+
+    // Use Couchbase Transactions
+    const transactions = cluster.transactions();
+
+    await transactions.run(async (ctx) => {
+      // 1. Get PatientTreatment doc (transactional get by key)
+      const ptDoc = await ctx.get(ptCollection, ptDocKey); // returns a GetResult
+      const ptContent = ptDoc.content();
+
+      // Defensive: re-check amendmentStatus inside transaction to avoid race
+      if (ptContent.amendmentStatus && AMENDMENT_STATUS_LIST.includes(ptContent.amendmentStatus)) {
+        // throw to abort transaction
+        throw new transactions.RollbackError("AmendmentInprogress");
+      }
+
+      // Update PatientTreatment doc in-memory
+      ptContent.amendmentStatus = "in-amendment";
+
+      // Push status history — assume `statusHistory` is an array; create if missing
+      if (!Array.isArray(ptContent.statusHistory)) ptContent.statusHistory = [];
+      ptContent.statusHistory.push(statusHistoryEntry);
+
+      // Optionally add amendmentOwner only if teammateID provided
+      if (teammateID) {
+        // We'll store amendmentOwner as singular object in `amendmentOwner` (aligning with original)
+        ptContent.amendmentOwner = amendmentOwnerEntry;
+
+        // Also, if you want to keep a list of owners, we can push to an array `amendmentOwners`:
+        if (!Array.isArray(ptContent.amendmentOwners)) ptContent.amendmentOwners = [];
+        ptContent.amendmentOwners.push(amendmentOwnerEntry);
+      }
+
+      // Replace the PatientTreatment document
+      await ctx.replace(ptDoc, ptContent);
+
+      // 2. Get PATH_Encounter document by id (we assume key == pathEncounterId)
+      const pathDocKey = patientTxData.pathEncounterId; // assumption: doc key equals id
+      const pathDoc = await ctx.get(pathCollection, pathDocKey);
+      const pathContent = pathDoc.content();
+
+      // Update PATH_Encounter doc
+      pathContent.status = "in-amendment";
+      if (!Array.isArray(pathContent.statusHistory)) pathContent.statusHistory = [];
+      pathContent.statusHistory.push(statusHistoryEntry);
+
+      await ctx.replace(pathDoc, pathContent);
+
+      // End of transaction callback; returning will commit
+      return;
+    });
+
+    console.log(`COMMITTED transaction successfully for pathEncounterId ${pathEncounterId}`);
+    return makeResponse(res, 200, { status: "success", message: "Started Amendment successfully" });
+
+  } catch (err) {
+    // If the RollbackError from inside transaction was thrown with message "AmendmentInprogress",
+    // translate it to the correct error response.
+    if (err && err.message === "AmendmentInprogress") {
+      return makeResponse(res, 409, {
+        errorCode: "AmendmentInprogress",
+        errorMessage: "Amendment of this treatment is in progress.",
+        pathEncounterId
+      });
+    }
+
+    console.error(`Error while processing for pathEncounterId ${pathEncounterId}:`, err);
+    return makeResponse(res, 500, {
+      errorCode: "AmendmentStatusUpdateFailed",
+      errorMessage: "Error occurred while changing the amendment status for treatment",
+      pathEncounterId,
+      details: (err && err.message) ? err.message : undefined
+    });
+  }
+};
