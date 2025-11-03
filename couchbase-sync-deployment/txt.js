@@ -17,23 +17,17 @@ const { v4: uuidv4 } = require('uuid');
 
 const AMENDMENT_STATUS_LIST = ["in-amendment", "amendment-submitted", "amendment-received"];
 
-/** Lazy-initialize Couchbase connections */
-let cluster = null;
-let bucket = null;
-let scope = null;
-let pathCollection = null;
-let ptCollection = null;
 
 /** Initialize Couchbase SDK once per function instance */
 async function initCouchbase() {
   if (cluster) return;
 
-  const connStr = process.env.COUCHBASE_CONNSTR;
-  const user = process.env.COUCHBASE_USER;
-  const pass = process.env.COUCHBASE_PASS;
-  const bucketName = process.env.COUCHBASE_BUCKET;
-  const scopeName = process.env.COUCHBASE_SCOPE || "_default";
-  const pathCollName = process.env.PATH_COLLECTION || "PATH_Encounter";
+  const connStr = process.env.COUCHBASE_CONNSTR || "couchbases://cb.wf6ax-4hcobxv2w.cloud.couchbase.com";
+  const user = process.env.COUCHBASE_USER || "mt-dev";
+  const pass = process.env.COUCHBASE_PASS || "D@v!t@2025";
+  const bucketName = process.env.COUCHBASE_BUCKET || "Path_Master_Load";
+  const scopeName = process.env.COUCHBASE_SCOPE || "masterdata";
+  const pathCollName = process.env.PATH_COLLECTION || "Encounter";
   const ptCollName = process.env.PT_COLLECTION || "PatientTreatment";
 
   if (!connStr || !user || !pass || !bucketName) {
@@ -95,14 +89,13 @@ exports.startAmendment = async (req, res) => {
     const scopeName = process.env.COUCHBASE_SCOPE || "_default";
     const ptCollName = process.env.PT_COLLECTION || "PatientTreatment";
 
-    // Parameterized N1QL: returns meta().id and the document.
     const query = `
-      SELECT META(pt).id AS __id, pt.*
+      SELECT pt.*
       FROM \`${bucketName}\`.\`${scopeName}\`.\`${ptCollName}\` AS pt
-      WHERE pt.pathEncounterId = $1
+      WHERE pt.encounterId = $1
       LIMIT 1
     `;
-    const queryResult = await cluster.query(query, { parameters: [pathEncounterId] });
+    const queryResult = await cluster.query(query, { parameters: [encounterId] });
 
     if (!queryResult.rows || queryResult.rows.length === 0) {
       return makeResponse(res, 404, {
@@ -112,12 +105,11 @@ exports.startAmendment = async (req, res) => {
       });
     }
 
-    const ptRow = queryResult.rows[0];
-    const ptDocKey = ptRow.__id;
-    const patientTxData = ptRow; // includes fields from pt.*
+    const patientTxData = queryResult.rows[0];
+    const ptDocID = ptRow.__id;
 
     // Check amendment status before starting transaction
-    if (patientTxData.amendmentStatus && AMENDMENT_STATUS_LIST.includes(patientTxData.amendmentStatus)) {
+    if (patientTxData.amendmentDisplayStatus && AMENDMENT_STATUS_LIST.includes(patientTxData.amendmentDisplayStatus)) {
       return makeResponse(res, 409, { // 409 Conflict
         errorCode: "AmendmentInprogress",
         errorMessage: "Amendment of this treatment is in progress.",
@@ -149,11 +141,11 @@ exports.startAmendment = async (req, res) => {
 
     await transactions.run(async (ctx) => {
       // 1. Get PatientTreatment doc (transactional get by key)
-      const ptDoc = await ctx.get(ptCollection, ptDocKey); // returns a GetResult
+      const ptDoc = await ctx.get(ptCollection, ptDocID); // returns a GetResult
       const ptContent = ptDoc.content();
 
       // Defensive: re-check amendmentStatus inside transaction to avoid race
-      if (ptContent.amendmentStatus && AMENDMENT_STATUS_LIST.includes(ptContent.amendmentStatus)) {
+      if (ptContent.amendmentDisplayStatus && AMENDMENT_STATUS_LIST.includes(ptContent.amendmentDisplayStatus)) {
         // throw to abort transaction
         throw new transactions.RollbackError("AmendmentInprogress");
       }
@@ -178,7 +170,7 @@ exports.startAmendment = async (req, res) => {
       // Replace the PatientTreatment document
       await ctx.replace(ptDoc, ptContent);
 
-      // 2. Get PATH_Encounter document by id (we assume key == pathEncounterId)
+      // 2. Get Encounter document by id (we assume id == EncounterId)
       const pathDocKey = patientTxData.pathEncounterId; // assumption: doc key equals id
       const pathDoc = await ctx.get(pathCollection, pathDocKey);
       const pathContent = pathDoc.content();
