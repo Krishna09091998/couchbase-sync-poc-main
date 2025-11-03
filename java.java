@@ -2,22 +2,16 @@ package com.path.custom.kafka.connect.transforms;
 
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.JsonNode;
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.commons.jexl3.JexlContext;
-import org.apache.commons.jexl3.MapContext;
-import org.apache.commons.jexl3.JexlExpression;
+import com.github.wnameless.json.flattener.JsonFlattener;
+import org.apache.commons.jexl3.*;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.connector.ConnectRecord;
 import org.apache.kafka.connect.transforms.Transformation;
-import org.apache.commons.jexl3.JexlBuilder;
-import org.apache.commons.jexl3.JexlEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Map;
-import java.util.HashMap;
-import java.util.List;
-import java.util.ArrayList;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Transformation<R> {
     private static final Logger log = LoggerFactory.getLogger(ConditionalDocumentFilter.class);
@@ -37,34 +31,29 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
             return null;
         }
 
-        log.debug("Applying filter to record key={} value type={}", record.key(), record.value().getClass());
-
         try {
-            JsonNode docNode;
             Object value = record.value();
+            JsonNode docNode;
 
-            // parse record value
+            // Parse record value
             if (value instanceof byte[]) {
                 String jsonString = new String((byte[]) value, StandardCharsets.UTF_8);
                 docNode = mapper.readTree(jsonString);
-                log.trace("Parsed byte[] record value");
             } else if (value instanceof String) {
                 docNode = mapper.readTree((String) value);
-                log.trace("Parsed String record value");
             } else if (value instanceof Map) {
                 docNode = mapper.valueToTree(value);
-                log.trace("Parsed Map record value");
             } else {
                 log.warn("Unsupported record value type: {}", value.getClass());
                 return record;
             }
 
-            // flatten JSON into Map for JEXL
-            Map<String, Object> flattenedMap = new HashMap<>();
-            flattenJsonIntoMap(flattenedMap, docNode);
-            JexlContext context = new MapContext(flattenedMap);
+            // ✅ Use JsonFlattener to flatten the JSON
+            String jsonString = mapper.writeValueAsString(docNode);
+            Map<String, Object> flattenedMap = JsonFlattener.flattenAsMap(jsonString);
 
-            log.debug("Evaluating JEXL expression for record key={}", record.key());
+            // Evaluate JEXL expression using flattened map
+            JexlContext context = new MapContext(flattenedMap);
             Boolean result = (Boolean) expression.evaluate(context);
 
             if (Boolean.FALSE.equals(result)) {
@@ -72,7 +61,7 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
                 return null;
             }
 
-            // convert JsonNode back to Map for downstream SMTs
+            // Convert JsonNode back to Map for downstream SMTs
             Map<String, Object> mapValue = mapper.convertValue(docNode, Map.class);
             R newRecord = (R) record.newRecord(
                     record.topic(),
@@ -113,64 +102,5 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
         JexlEngine jexl = new JexlBuilder().create();
         this.expression = jexl.createExpression(exprString);
         log.info("Initialized conditional document filter with expression: {}", exprString);
-    }
-
-    // Flatten JSON into Map (objects as Maps, arrays as Lists, leaves as primitives)
-    private void flattenJsonIntoMap(Map<String, Object> map, JsonNode node) {
-        if (node.isObject()) {
-            node.fieldNames().forEachRemaining(field -> {
-                JsonNode child = node.get(field);
-                if (child.isValueNode()) {
-                    if (child.isTextual()) map.put(field, child.textValue());
-                    else if (child.isNumber()) map.put(field, child.numberValue());
-                    else if (child.isBoolean()) map.put(field, child.booleanValue());
-                    else if (child.isNull()) map.put(field, null);
-                } else if (child.isObject()) {
-                    Map<String, Object> childMap = new HashMap<>();
-                    map.put(field, childMap);
-                    flattenJsonIntoMap(childMap, child);
-                } else if (child.isArray()) {
-                    List<Object> list = new ArrayList<>();
-                    map.put(field, list);
-                    for (JsonNode el : child) {
-                        if (el.isValueNode()) {
-                            if (el.isTextual()) list.add(el.textValue());
-                            else if (el.isNumber()) list.add(el.numberValue());
-                            else if (el.isBoolean()) list.add(el.booleanValue());
-                            else if (el.isNull()) list.add(null);
-                        } else if (el.isObject()) {
-                            Map<String, Object> elMap = new HashMap<>();
-                            list.add(elMap);
-                            flattenJsonIntoMap(elMap, el);
-                        } else if (el.isArray()) {
-                            // nested arrays
-                            List<Object> nestedList = new ArrayList<>();
-                            list.add(nestedList);
-                            flattenJsonIntoList(nestedList, el);
-                        }
-                    }
-                }
-            });
-        }
-    }
-
-    // Helper for nested arrays
-    private void flattenJsonIntoList(List<Object> list, JsonNode arrayNode) {
-        for (JsonNode el : arrayNode) {
-            if (el.isValueNode()) {
-                if (el.isTextual()) list.add(el.textValue());
-                else if (el.isNumber()) list.add(el.numberValue());
-                else if (el.isBoolean()) list.add(el.booleanValue());
-                else if (el.isNull()) list.add(null);
-            } else if (el.isObject()) {
-                Map<String, Object> elMap = new HashMap<>();
-                list.add(elMap);
-                flattenJsonIntoMap(elMap, el);
-            } else if (el.isArray()) {
-                List<Object> nestedList = new ArrayList<>();
-                list.add(nestedList);
-                flattenJsonIntoList(nestedList, el);
-            }
-        }
     }
 }
