@@ -33,11 +33,11 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
     @Override
     public R apply(R record) {
         if (record.value() == null) {
-            log.info("Record value is null, skipping key={}", record.key());
+            log.debug("Record value is null, skipping key={}", record.key());
             return null;
         }
 
-        log.info("Applying filter to record key={} value type={}", record.key(), record.value().getClass());
+        log.debug("Applying filter to record key={} value type={}", record.key(), record.value().getClass());
 
         try {
             JsonNode docNode;
@@ -47,13 +47,13 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
             if (value instanceof byte[]) {
                 String jsonString = new String((byte[]) value, StandardCharsets.UTF_8);
                 docNode = mapper.readTree(jsonString);
-                log.info("Parsed byte[] record value");
+                log.trace("Parsed byte[] record value");
             } else if (value instanceof String) {
                 docNode = mapper.readTree((String) value);
-                log.info("Parsed String record value");
+                log.trace("Parsed String record value");
             } else if (value instanceof Map) {
                 docNode = mapper.valueToTree(value);
-                log.info("Parsed Map record value");
+                log.trace("Parsed Map record value");
             } else {
                 log.warn("Unsupported record value type: {}", value.getClass());
                 return record;
@@ -64,7 +64,7 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
             flattenJsonIntoMap(flattenedMap, docNode);
             JexlContext context = new MapContext(flattenedMap);
 
-            log.info("Evaluating JEXL expression for record key={}", record.key());
+            log.debug("Evaluating JEXL expression for record key={}", record.key());
             Boolean result = (Boolean) expression.evaluate(context);
 
             if (Boolean.FALSE.equals(result)) {
@@ -84,7 +84,7 @@ public class ConditionalDocumentFilter<R extends ConnectRecord<R>> implements Tr
                     record.timestamp()
             );
 
-            log.info("Record passed filter, producing new record: key={}", record.key());
+            log.debug("Record passed filter, producing new record: key={}", record.key());
             return newRecord;
 
         } catch (Exception e) {
